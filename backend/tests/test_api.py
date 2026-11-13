@@ -1,0 +1,196 @@
+from io import BytesIO
+from uuid import uuid4
+
+from PIL import Image
+
+from app.config import Settings, get_settings
+
+
+def create_map(client, user="alice"):
+    response = client.post(
+        "/api/maps",
+        headers={"X-Dev-User": user},
+        json={"name": "Field notes"},
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def create_point(client, map_record, layer, user="alice", point_id=None):
+    point_id = point_id or str(uuid4())
+    response = client.post(
+        "/api/maps/{0}/points".format(map_record["id"]),
+        headers={"X-Dev-User": user},
+        json={
+            "id": point_id,
+            "layer_id": layer["id"],
+            "lat": 51.5,
+            "lng": -0.12,
+            "title": "Field observation",
+            "captured_at": "2026-11-13T10:00:00Z",
+            "client_created_at": "2026-11-13T09:59:30Z",
+            "location_accuracy_m": 7.5,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def test_private_maps_spatial_queries_idempotency_and_conflicts(client):
+    map_record = create_map(client)
+    assert map_record["visibility"] == "private"
+    assert client.get(
+        "/api/maps/{0}".format(map_record["id"]), headers={"X-Dev-User": "bob"}
+    ).status_code == 404
+
+    layer = client.get(
+        "/api/maps/{0}/layers".format(map_record["id"]),
+        headers={"X-Dev-User": "alice"},
+    ).json()[0]
+    point_id = str(uuid4())
+    point = create_point(client, map_record, layer, point_id=point_id)
+    assert point["lat"] == 51.5
+    assert point["lng"] == -0.12
+    assert point["location_accuracy_m"] == 7.5
+
+    retry = create_point(client, map_record, layer, point_id=point_id)
+    assert retry["id"] == point_id
+    assert retry["version"] == 1
+
+    visible = client.get(
+        "/api/maps/{0}/points".format(map_record["id"]),
+        headers={"X-Dev-User": "alice"},
+        params={"min_lng": -0.2, "min_lat": 51.4, "max_lng": 0.1, "max_lat": 51.6},
+    )
+    assert visible.status_code == 200
+    assert [item["id"] for item in visible.json()] == [point_id]
+
+    outside = client.get(
+        "/api/maps/{0}/points".format(map_record["id"]),
+        headers={"X-Dev-User": "alice"},
+        params={"min_lng": 5, "min_lat": 51.4, "max_lng": 6, "max_lat": 51.6},
+    )
+    assert outside.json() == []
+
+    updated = client.patch(
+        "/api/points/{0}".format(point_id),
+        headers={"X-Dev-User": "alice"},
+        json={"expected_version": 1, "title": "Updated field note"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["version"] == 2
+    conflict = client.patch(
+        "/api/points/{0}".format(point_id),
+        headers={"X-Dev-User": "alice"},
+        json={"expected_version": 1, "title": "Stale edit"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["current_version"] == 2
+
+    events = client.get(
+        "/api/maps/{0}/changes".format(map_record["id"]),
+        headers={"X-Dev-User": "alice"},
+    )
+    assert [event["action"] for event in events.json()] == ["created", "updated"]
+
+
+def test_membership_roles_and_layers_protect_data(client):
+    map_record = create_map(client)
+    owner_headers = {"X-Dev-User": "alice"}
+    map_id = map_record["id"]
+    layer = client.get(
+        "/api/maps/{0}/layers".format(map_id), headers=owner_headers
+    ).json()[0]
+
+    added = client.post(
+        "/api/maps/{0}/members".format(map_id),
+        headers=owner_headers,
+        json={"user_id": "viewer", "role": "viewer"},
+    )
+    assert added.status_code == 201
+    assert client.get(
+        "/api/maps/{0}".format(map_id), headers={"X-Dev-User": "viewer"}
+    ).status_code == 200
+    assert client.post(
+        "/api/maps/{0}/points".format(map_id),
+        headers={"X-Dev-User": "viewer"},
+        json={
+            "id": str(uuid4()),
+            "layer_id": layer["id"],
+            "lat": 51.5,
+            "lng": -0.12,
+        },
+    ).status_code == 403
+
+    client.post(
+        "/api/maps/{0}/members".format(map_id),
+        headers=owner_headers,
+        json={"user_id": "editor", "role": "editor"},
+    )
+    point = create_point(client, map_record, layer, user="editor")
+    assert point["created_by"] == "editor"
+
+    assert client.delete(
+        "/api/layers/{0}".format(layer["id"]), headers=owner_headers
+    ).status_code == 409
+    assert client.delete(
+        "/api/points/{0}".format(point["id"]),
+        headers={"X-Dev-User": "editor"},
+        params={"expected_version": point["version"]},
+    ).status_code == 204
+    assert client.delete(
+        "/api/layers/{0}".format(layer["id"]), headers=owner_headers
+    ).status_code == 409
+
+
+def test_photo_validation_storage_and_private_access(client):
+    map_record = create_map(client)
+    headers = {"X-Dev-User": "alice"}
+    layer = client.get(
+        "/api/maps/{0}/layers".format(map_record["id"]), headers=headers
+    ).json()[0]
+    point = create_point(client, map_record, layer)
+
+    image = Image.new("RGB", (800, 400), color="forestgreen")
+    image_bytes = BytesIO()
+    image.save(image_bytes, format="PNG")
+    upload = client.post(
+        "/api/points/{0}/photos".format(point["id"]),
+        headers=headers,
+        data={"expected_version": str(point["version"])},
+        files={"file": ("unsafe name.png", image_bytes.getvalue(), "image/png")},
+    )
+    assert upload.status_code == 201
+    photo = upload.json()
+    assert photo["width"] == 800
+    assert photo["mime_type"] == "image/png"
+
+    denied = client.get(photo["url"], headers={"X-Dev-User": "bob"})
+    assert denied.status_code == 404
+    thumbnail = client.get(photo["thumbnail_url"], headers=headers)
+    assert thumbnail.status_code == 200
+    assert thumbnail.headers["content-type"].startswith("image/jpeg")
+
+    invalid = client.post(
+        "/api/points/{0}/photos".format(point["id"]),
+        headers=headers,
+        data={"expected_version": str(photo["point_version"])},
+        files={"file": ("fake.jpg", b"not an image", "image/jpeg")},
+    )
+    assert invalid.status_code == 415
+
+    assert client.delete(
+        "/api/photos/{0}".format(photo["id"]),
+        headers=headers,
+        params={"expected_version": photo["point_version"]},
+    ).status_code == 204
+
+
+def test_production_mode_does_not_accept_development_identity(client):
+    production_settings = Settings(app_environment="production")
+    client.app.dependency_overrides[get_settings] = lambda: production_settings
+
+    response = client.get("/api/maps", headers={"X-Dev-User": "owner"})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "No production identity adapter is configured"

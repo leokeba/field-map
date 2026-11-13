@@ -1,0 +1,943 @@
+<script setup lang="ts">
+import L, { type Map as LeafletMap, type Marker } from 'leaflet'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+
+import { getSyncSummary } from './offline-sync'
+import {
+  createLocalPoint,
+  deleteLocalPoint,
+  fetchPointsInBounds,
+  getCachedPoints,
+  initializeWorkspace,
+  keepLocalVersion,
+  retryFailedPhoto,
+  retryPointOperation,
+  syncMap,
+  updateLocalPoint,
+  useServerVersion,
+} from './offline-sync'
+import { offlineDb } from './offline-db'
+import type {
+  FieldLayer,
+  FieldPoint,
+  PhotoReference,
+  StoredPhoto,
+  SyncStatus,
+} from './types'
+
+interface DraftPhoto extends PhotoReference {
+  file?: Blob
+  mimeType?: string
+  previewUrl?: string
+  remoteId?: string
+  isNew?: boolean
+}
+
+interface PointDraft {
+  lat: number
+  lng: number
+  title: string
+  description: string
+  layerId: string
+  capturedAt: string
+  accuracyM: number | null
+  photos: DraftPhoto[]
+  removedPhotoIds: string[]
+}
+
+const layers = ref<FieldLayer[]>([])
+const points = ref<FieldPoint[]>([])
+const mapId = ref<string | null>(null)
+const activeLayerId = ref('')
+const visibleLayerIds = ref<string[]>([])
+const placementMode = ref(false)
+const form = ref<PointDraft | null>(null)
+const editingPointId = ref<string | null>(null)
+const selectedPoint = ref<FieldPoint | null>(null)
+const statusMessage = ref('')
+const syncLabel = ref('Connecting…')
+const photoUrls = ref<Record<string, string>>({})
+const cameraInput = ref<HTMLInputElement | null>(null)
+const galleryInput = ref<HTMLInputElement | null>(null)
+
+const activeLayer = computed(
+  () =>
+    layers.value.find((layer) => layer.id === activeLayerId.value) ??
+    layers.value[0] ??
+    { id: '', name: 'Layers', color: '#318b69' },
+)
+const formLayer = computed(
+  () =>
+    layers.value.find((layer) => layer.id === form.value?.layerId) ??
+    layers.value[0] ??
+    { id: '', name: 'Layers', color: '#318b69' },
+)
+const isEditing = computed(() => editingPointId.value !== null)
+const tileUrl =
+  import.meta.env.VITE_TILE_URL ??
+  'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
+const currentUserId = import.meta.env.DEV
+  ? import.meta.env.VITE_DEV_USER ?? 'local-user'
+  : 'unknown'
+
+let map: LeafletMap | undefined
+let draftMarker: Marker | undefined
+let currentLocationMarker: L.CircleMarker | undefined
+const pointMarkers = new Map<string, Marker>()
+let statusTimer: number | undefined
+let pollingTimer: number | undefined
+let boundsTimer: number | undefined
+
+function layerFor(id: string): FieldLayer | undefined {
+  return layers.value.find((layer) => layer.id === id)
+}
+
+function markerIcon(color: string, draft = false, syncStatus?: SyncStatus): L.DivIcon {
+  const markerClass = draft ? 'draft-pin' : `map-pin ${syncStatus ?? ''}`
+  return L.divIcon({
+    className: '',
+    html: `<span class="${markerClass}" style="--pin-color:${color}"></span>`,
+    iconSize: [28, 36],
+    iconAnchor: [14, 33],
+  })
+}
+
+function renderMarkers(): void {
+  if (!map) return
+
+  pointMarkers.forEach((marker) => marker.remove())
+  pointMarkers.clear()
+
+  for (const point of points.value) {
+    if (
+      point.syncStatus === 'delete-pending' ||
+      !visibleLayerIds.value.includes(point.layerId)
+    ) {
+      continue
+    }
+    const marker = L.marker([point.lat, point.lng], {
+      icon: markerIcon(layerFor(point.layerId)?.color ?? '#318b69', false, point.syncStatus),
+      keyboard: true,
+      title: point.title || layerFor(point.layerId)?.name || 'Field point',
+    }).addTo(map)
+    marker.on('click', () => {
+      selectedPoint.value = point
+      form.value = null
+    })
+    pointMarkers.set(point.id, marker)
+  }
+}
+
+function showStatus(message: string): void {
+  statusMessage.value = message
+  window.clearTimeout(statusTimer)
+  statusTimer = window.setTimeout(() => {
+    statusMessage.value = ''
+  }, 4000)
+}
+
+function photoUrl(photo: Pick<PhotoReference, 'id'> & { previewUrl?: string }): string {
+  return photo.previewUrl ?? photoUrls.value[photo.id] ?? ''
+}
+
+async function refreshPhotoUrls(): Promise<void> {
+  const photos = [
+    ...points.value.flatMap((point) => point.photos),
+    ...(form.value?.photos ?? []),
+  ]
+  const activeIds = new Set(photos.map((photo) => photo.id))
+  for (const [id, url] of Object.entries(photoUrls.value)) {
+    if (!activeIds.has(id)) {
+      URL.revokeObjectURL(url)
+      delete photoUrls.value[id]
+    }
+  }
+  for (const photo of photos) {
+    if (photoUrls.value[photo.id]) continue
+    const stored = await offlineDb.photos.get(photo.id)
+    if (stored) photoUrls.value[photo.id] = URL.createObjectURL(stored.file)
+  }
+}
+
+async function refreshPointsFromStore(): Promise<void> {
+  if (!mapId.value) return
+  const cached = await getCachedPoints(mapId.value)
+  const loaded = await Promise.all(
+    cached.map(async (point) => ({
+      ...point,
+      photos: await Promise.all(
+        point.photos.map(async (photo) => {
+          const stored = await offlineDb.photos.get(photo.id)
+          return stored ? { ...photo, status: stored.status } : photo
+        }),
+      ),
+    })),
+  )
+  const selectedId = selectedPoint.value?.id
+  points.value = loaded
+  await refreshPhotoUrls()
+  if (selectedId) {
+    selectedPoint.value = loaded.find((point) => point.id === selectedId) ?? null
+  }
+}
+
+async function updateSyncLabel(): Promise<void> {
+  if (!navigator.onLine) {
+    syncLabel.value = 'Offline · saved on device'
+    return
+  }
+  if (!mapId.value) {
+    syncLabel.value = 'Waiting for map'
+    return
+  }
+  const summary = await getSyncSummary(mapId.value)
+  if (summary.conflicts) syncLabel.value = 'Changes need review'
+  else if (summary.failed) syncLabel.value = 'Upload needs retry'
+  else if (summary.pending) syncLabel.value = 'Syncing changes…'
+  else syncLabel.value = 'All changes synced'
+}
+
+async function runSync(): Promise<void> {
+  if (!mapId.value) return
+  if (!navigator.onLine) {
+    await updateSyncLabel()
+    return
+  }
+  syncLabel.value = 'Syncing changes…'
+  try {
+    await syncMap(mapId.value)
+    await refreshPointsFromStore()
+    await updateSyncLabel()
+  } catch (error) {
+    syncLabel.value = 'Sync paused'
+    showStatus(error instanceof Error ? error.message : 'Synchronization failed')
+  }
+}
+
+async function refreshVisibleBounds(): Promise<void> {
+  if (!map || !mapId.value || !navigator.onLine) return
+  const bounds = map.getBounds().pad(0.08)
+  await fetchPointsInBounds(mapId.value, {
+    west: Math.max(-180, bounds.getWest()),
+    south: Math.max(-90, bounds.getSouth()),
+    east: Math.min(180, bounds.getEast()),
+    north: Math.min(90, bounds.getNorth()),
+  })
+  await refreshPointsFromStore()
+}
+
+function scheduleBoundsRefresh(): void {
+  window.clearTimeout(boundsTimer)
+  boundsTimer = window.setTimeout(() => {
+    void refreshVisibleBounds().catch((error: unknown) => {
+      showStatus(error instanceof Error ? error.message : 'Could not refresh map points')
+    })
+  }, 250)
+}
+
+async function initialize(): Promise<void> {
+  try {
+    const workspace = await initializeWorkspace()
+    mapId.value = workspace.map.id
+    layers.value = workspace.layers
+    if (!activeLayerId.value || !layerFor(activeLayerId.value)) {
+      activeLayerId.value = workspace.layers[0].id
+    }
+    visibleLayerIds.value = workspace.layers
+      .filter((layer) => layer.is_visible_by_default)
+      .map((layer) => layer.id)
+    await refreshPointsFromStore()
+    if (navigator.onLine) {
+      try {
+        await refreshVisibleBounds()
+        await runSync()
+      } catch (error) {
+        showStatus(error instanceof Error ? error.message : 'Showing cached map data')
+      }
+    } else {
+      await updateSyncLabel()
+    }
+  } catch (error) {
+    syncLabel.value = 'Map unavailable'
+    showStatus(error instanceof Error ? error.message : 'Could not load a map')
+  }
+}
+
+function setDraftLocation(lat: number, lng: number, accuracyM: number | null = null): void {
+  if (!form.value || !map) return
+  form.value.lat = lat
+  form.value.lng = lng
+  form.value.accuracyM = accuracyM
+  map.setView([lat, lng], Math.max(map.getZoom(), 15), { animate: true })
+  draftMarker?.remove()
+  draftMarker = L.marker([lat, lng], {
+    icon: markerIcon(formLayer.value?.color ?? '#318b69', true),
+    draggable: true,
+    title: 'Drag to adjust point location',
+  }).addTo(map)
+  draftMarker.on('dragend', () => {
+    const position = draftMarker?.getLatLng()
+    if (position && form.value) {
+      form.value.lat = position.lat
+      form.value.lng = position.lng
+      form.value.accuracyM = null
+    }
+  })
+}
+
+function beginPoint(lat: number, lng: number, accuracyM: number | null = null): void {
+  if (!mapId.value) {
+    showStatus('Connect once to load or create a map')
+    return
+  }
+  selectedPoint.value = null
+  editingPointId.value = null
+  placementMode.value = false
+  form.value = {
+    lat,
+    lng,
+    title: '',
+    description: '',
+    layerId: activeLayerId.value,
+    capturedAt: new Date().toISOString(),
+    accuracyM,
+    photos: [],
+    removedPhotoIds: [],
+  }
+  setDraftLocation(lat, lng, accuracyM)
+}
+
+function closeSheet(force = false): boolean {
+  if (form.value && !force && !window.confirm('Discard this unsaved point?')) return false
+  if (form.value) {
+    for (const photo of form.value.photos) {
+      if (photo.isNew && photo.previewUrl) {
+        URL.revokeObjectURL(photo.previewUrl)
+        delete photoUrls.value[photo.id]
+      }
+    }
+  }
+  form.value = null
+  selectedPoint.value = null
+  editingPointId.value = null
+  draftMarker?.remove()
+  draftMarker = undefined
+  void refreshPhotoUrls()
+  return true
+}
+
+function startPlacement(): void {
+  if (!closeSheet()) return
+  placementMode.value = true
+  statusMessage.value = ''
+}
+
+function useCurrentLocation(): void {
+  if (!navigator.geolocation) {
+    showStatus('Location is not available in this browser')
+    return
+  }
+  navigator.geolocation.getCurrentPosition(
+    ({ coords }) => {
+      if (placementMode.value && !form.value) {
+        beginPoint(coords.latitude, coords.longitude, coords.accuracy)
+      } else if (form.value) {
+        setDraftLocation(coords.latitude, coords.longitude, coords.accuracy)
+      } else if (map) {
+        map.setView([coords.latitude, coords.longitude], 16, { animate: true })
+        currentLocationMarker?.remove()
+        currentLocationMarker = L.circleMarker([coords.latitude, coords.longitude], {
+          radius: 8,
+          color: '#fff',
+          weight: 3,
+          fillColor: '#4388e8',
+          fillOpacity: 1,
+        })
+          .addTo(map)
+          .bindTooltip('Your location')
+      }
+      showStatus('Showing your current location')
+    },
+    (error) => {
+      const message =
+        error.code === error.PERMISSION_DENIED
+          ? 'Location permission was denied'
+          : 'Could not get your location; tap the map to place a point'
+      showStatus(message)
+    },
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 },
+  )
+}
+
+async function editPoint(point: FieldPoint): Promise<void> {
+  selectedPoint.value = null
+  editingPointId.value = point.id
+  const photos: DraftPhoto[] = await Promise.all(
+    point.photos.map(async (photo) => {
+      const stored = await offlineDb.photos.get(photo.id)
+      return {
+        ...photo,
+        file: stored?.file,
+        mimeType: stored?.mimeType,
+        remoteId: stored?.remoteId,
+        isNew: false,
+      }
+    }),
+  )
+  form.value = {
+    lat: point.lat,
+    lng: point.lng,
+    title: point.title,
+    description: point.description,
+    layerId: point.layerId,
+    capturedAt: point.capturedAt,
+    accuracyM: point.accuracyM,
+    photos,
+    removedPhotoIds: [],
+  }
+  setDraftLocation(point.lat, point.lng, point.accuracyM)
+}
+
+async function savePoint(): Promise<void> {
+  if (!form.value || !mapId.value) return
+  const draft = form.value
+  const pointId = editingPointId.value ?? crypto.randomUUID()
+  const photoReferences: PhotoReference[] = draft.photos.map(
+    ({ id, filename, status, capturedAt }) => ({ id, filename, status, capturedAt }),
+  )
+  const addedPhotos: StoredPhoto[] = draft.photos
+    .filter(
+      (photo): photo is DraftPhoto & { file: Blob } => photo.isNew === true && photo.file !== undefined,
+    )
+    .map((photo) => ({
+      id: photo.id,
+      pointId,
+      file: photo.file,
+      filename: photo.filename,
+      mimeType: photo.mimeType ?? photo.file?.type ?? 'image/jpeg',
+      capturedAt: photo.capturedAt,
+      status: 'pending',
+    }))
+
+  try {
+    if (editingPointId.value) {
+      const existing = points.value.find((point) => point.id === editingPointId.value)
+      if (!existing) throw new Error('The point being edited is no longer available')
+      const updated: FieldPoint = {
+        ...existing,
+        lat: draft.lat,
+        lng: draft.lng,
+        title: draft.title,
+        description: draft.description,
+        layerId: draft.layerId,
+        capturedAt: draft.capturedAt,
+        accuracyM: draft.accuracyM,
+        photos: photoReferences,
+        syncStatus: 'pending',
+      }
+      await updateLocalPoint(updated, addedPhotos, draft.removedPhotoIds)
+    } else {
+      const point: FieldPoint = {
+        id: pointId,
+        mapId: mapId.value,
+        layerId: draft.layerId,
+        lat: draft.lat,
+        lng: draft.lng,
+        title: draft.title,
+        description: draft.description,
+        capturedAt: draft.capturedAt,
+        clientCreatedAt: new Date().toISOString(),
+        accuracyM: draft.accuracyM,
+        author: currentUserId,
+        version: null,
+        syncStatus: 'pending',
+        photos: photoReferences,
+      }
+      await createLocalPoint(point, addedPhotos)
+    }
+    closeSheet(true)
+    await refreshPointsFromStore()
+    await updateSyncLabel()
+    showStatus(navigator.onLine ? 'Saved on this device · syncing…' : 'Saved on this device · will sync when online')
+    void runSync()
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not save point locally')
+  }
+}
+
+async function deletePoint(point: FieldPoint): Promise<void> {
+  if (!window.confirm('Delete this point?')) return
+  try {
+    await deleteLocalPoint(point)
+    closeSheet(true)
+    await refreshPointsFromStore()
+    await updateSyncLabel()
+    void runSync()
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not queue point deletion')
+  }
+}
+
+async function preparePhoto(file: File): Promise<{ blob: Blob; filename: string }> {
+  const preserveOriginal = import.meta.env.VITE_PRESERVE_ORIGINALS === 'true'
+  if (preserveOriginal || file.size <= 2_000_000) {
+    return { blob: file, filename: file.name }
+  }
+  const bitmap = await createImageBitmap(file)
+  const scale = Math.min(1, 2048 / Math.max(bitmap.width, bitmap.height))
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.round(bitmap.width * scale)
+  canvas.height = Math.round(bitmap.height * scale)
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('Could not prepare this photo for upload')
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+  bitmap.close()
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (result) => (result ? resolve(result) : reject(new Error('Could not compress this photo'))),
+      'image/jpeg',
+      0.82,
+    )
+  })
+  return { blob, filename: file.name.replace(/\.[^.]+$/, '') + '.jpg' }
+}
+
+async function handlePhotoSelection(event: Event): Promise<void> {
+  const input = event.target
+  if (!(input instanceof HTMLInputElement) || !input.files || !form.value) return
+  try {
+    for (const file of Array.from(input.files)) {
+      const prepared = await preparePhoto(file)
+      const photo: DraftPhoto = {
+        id: crypto.randomUUID(),
+        filename: prepared.filename,
+        mimeType: prepared.blob.type || file.type,
+        capturedAt: null,
+        status: 'pending',
+        file: prepared.blob,
+        isNew: true,
+      }
+      photo.previewUrl = URL.createObjectURL(prepared.blob)
+      photoUrls.value[photo.id] = photo.previewUrl
+      form.value.photos.push(photo)
+    }
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not load selected photos')
+  } finally {
+    input.value = ''
+  }
+}
+
+function removePhoto(index: number): void {
+  const photo = form.value?.photos[index]
+  if (!photo || !form.value) return
+  if (photo.isNew && photo.previewUrl) {
+    URL.revokeObjectURL(photo.previewUrl)
+    delete photoUrls.value[photo.id]
+  } else {
+    form.value.removedPhotoIds.push(photo.id)
+  }
+  form.value.photos.splice(index, 1)
+}
+
+function toggleLayer(layerId: string): void {
+  visibleLayerIds.value = visibleLayerIds.value.includes(layerId)
+    ? visibleLayerIds.value.filter((id) => id !== layerId)
+    : [...visibleLayerIds.value, layerId]
+}
+
+function formatDate(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value))
+}
+
+function formatCoordinate(value: number): string {
+  return value.toFixed(5)
+}
+
+function syncDescription(status: SyncStatus): string {
+  if (status === 'pending') return 'Waiting to sync'
+  if (status === 'delete-pending') return 'Deletion waiting to sync'
+  if (status === 'conflict') return 'This point changed on another device'
+  if (status === 'failed') return 'Sync failed; your local copy is preserved'
+  return 'Synced'
+}
+
+async function resolveWithLocal(): Promise<void> {
+  if (!selectedPoint.value) return
+  const id = selectedPoint.value.id
+  try {
+    await keepLocalVersion(id)
+    await refreshPointsFromStore()
+    selectedPoint.value = points.value.find((point) => point.id === id) ?? null
+    void runSync()
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not keep local changes')
+  }
+}
+
+async function resolveWithServer(): Promise<void> {
+  if (!selectedPoint.value) return
+  const id = selectedPoint.value.id
+  try {
+    await useServerVersion(id)
+    await refreshPointsFromStore()
+    selectedPoint.value = points.value.find((point) => point.id === id) ?? null
+    if (!selectedPoint.value) closeSheet(true)
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not use server version')
+  }
+}
+
+async function retryPhoto(photoId: string): Promise<void> {
+  await retryFailedPhoto(photoId)
+  await runSync()
+}
+
+async function retryPoint(pointId: string): Promise<void> {
+  await retryPointOperation(pointId)
+  await runSync()
+}
+
+function updatePointReferences(): void {
+  if (selectedPoint.value) {
+    selectedPoint.value = points.value.find((point) => point.id === selectedPoint.value?.id) ?? null
+  }
+}
+
+watch(
+  [points, visibleLayerIds],
+  () => {
+    renderMarkers()
+    updatePointReferences()
+  },
+  { deep: true },
+)
+
+watch(
+  () => form.value?.layerId,
+  () => {
+    if (form.value && draftMarker) {
+      draftMarker.setIcon(markerIcon(formLayer.value?.color ?? '#318b69', true))
+    }
+  },
+)
+
+onMounted(() => {
+  map = L.map('map', { zoomControl: false }).setView([51.5072, -0.1276], 14)
+  L.tileLayer(tileUrl, {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxZoom: 19,
+  }).addTo(map)
+  L.control.zoom({ position: 'bottomright' }).addTo(map)
+  map.on('click', ({ latlng }) => {
+    if (placementMode.value) beginPoint(latlng.lat, latlng.lng)
+  })
+  map.on('moveend', scheduleBoundsRefresh)
+  void initialize()
+  pollingTimer = window.setInterval(() => void runSync(), 15000)
+  window.addEventListener('online', runSync)
+  window.addEventListener('offline', updateSyncLabel)
+})
+
+onBeforeUnmount(() => {
+  window.clearTimeout(statusTimer)
+  window.clearTimeout(boundsTimer)
+  window.clearInterval(pollingTimer)
+  window.removeEventListener('online', runSync)
+  window.removeEventListener('offline', updateSyncLabel)
+  Object.values(photoUrls.value).forEach((url) => URL.revokeObjectURL(url))
+  map?.remove()
+})
+</script>
+
+<template>
+  <main class="app-shell">
+    <div id="map" class="map-canvas" :class="{ 'is-placing': placementMode }"></div>
+
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Field Map home" @click.prevent="closeSheet()">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 21s7-6.1 7-12a7 7 0 1 0-14 0c0 5.9 7 12 7 12Z" />
+            <circle cx="12" cy="9" r="2.5" />
+          </svg>
+        </span>
+        <span>
+          <strong>Field Map</strong>
+          <small>{{ syncLabel }}</small>
+        </span>
+      </a>
+
+      <details v-if="layers.length" class="layers-menu">
+        <summary aria-label="Choose active layer and visibility">
+          <span class="layer-dot" :style="{ backgroundColor: activeLayer.color }"></span>
+          <span class="active-layer-name">{{ activeLayer.name }}</span>
+          <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="m4 6 4 4 4-4" />
+          </svg>
+        </summary>
+        <div class="layers-popover">
+          <p class="menu-heading">Add points to</p>
+          <button
+            v-for="layer in layers"
+            :key="layer.id"
+            class="layer-choice"
+            :class="{ selected: activeLayerId === layer.id }"
+            type="button"
+            @click="activeLayerId = layer.id"
+          >
+            <span class="layer-dot" :style="{ backgroundColor: layer.color }"></span>
+            <span>{{ layer.name }}</span>
+            <span v-if="activeLayerId === layer.id" class="active-check" aria-label="active">✓</span>
+          </button>
+          <div class="menu-divider"></div>
+          <p class="menu-heading">Show on map</p>
+          <label v-for="layer in layers" :key="`visible-${layer.id}`" class="visibility-choice">
+            <input
+              type="checkbox"
+              :checked="visibleLayerIds.includes(layer.id)"
+              @change="toggleLayer(layer.id)"
+            />
+            <span class="layer-dot" :style="{ backgroundColor: layer.color }"></span>
+            <span>{{ layer.name }}</span>
+          </label>
+        </div>
+      </details>
+    </header>
+
+    <div v-if="placementMode" class="placement-hint" role="status">
+      <span class="hint-target" aria-hidden="true">⌖</span>
+      Tap the map or location button to place a point
+      <button type="button" aria-label="Cancel placement" @click="placementMode = false">×</button>
+    </div>
+
+    <div v-if="statusMessage" class="status-toast" role="status">{{ statusMessage }}</div>
+
+    <div class="map-actions">
+      <button
+        class="icon-button location-button"
+        type="button"
+        :aria-label="placementMode ? 'Use current location to add point' : 'Show my location'"
+        @click="useCurrentLocation"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="7" />
+          <circle cx="12" cy="12" r="2" />
+          <path d="M12 2v3m0 14v3M2 12h3m14 0h3" />
+        </svg>
+      </button>
+      <button class="add-point-button" type="button" :disabled="!mapId" @click="startPlacement">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 5v14M5 12h14" />
+        </svg>
+        <span>Add point</span>
+      </button>
+    </div>
+
+    <Transition name="sheet">
+      <section
+        v-if="form"
+        class="bottom-sheet editor-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="editor-title"
+      >
+        <div class="sheet-grabber" aria-hidden="true"></div>
+        <div class="sheet-header">
+          <div>
+            <p class="eyebrow">{{ isEditing ? 'UPDATE OBSERVATION' : 'NEW OBSERVATION' }}</p>
+            <h1 id="editor-title">{{ isEditing ? 'Edit point' : 'Add a point' }}</h1>
+          </div>
+          <button class="sheet-close" type="button" aria-label="Close editor" @click="closeSheet()">×</button>
+        </div>
+
+        <div class="sheet-content">
+          <label class="field-label" for="point-title">Title <span>Optional</span></label>
+          <input id="point-title" v-model="form.title" class="text-input" maxlength="120" placeholder="What did you find?" />
+
+          <label class="field-label description-label" for="point-description">Note <span>Optional</span></label>
+          <textarea
+            id="point-description"
+            v-model="form.description"
+            class="text-input description-input"
+            maxlength="10000"
+            rows="2"
+            placeholder="Add a little more detail"
+          ></textarea>
+
+          <div class="field-row">
+            <label class="field-label" for="point-layer">Layer</label>
+            <label class="layer-select-wrap">
+              <span class="layer-dot" :style="{ backgroundColor: formLayer.color }"></span>
+              <select id="point-layer" v-model="form.layerId" aria-label="Point layer">
+                <option v-for="layer in layers" :key="layer.id" :value="layer.id">{{ layer.name }}</option>
+              </select>
+              <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="m4 6 4 4 4-4" />
+              </svg>
+            </label>
+          </div>
+
+          <div class="photo-row">
+            <div>
+              <p class="field-label">Photos <span>Optional</span></p>
+              <p class="field-help">Add a photo to help tell the story.</p>
+            </div>
+            <div class="photo-actions">
+              <button class="photo-button" type="button" @click="cameraInput?.click()">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 7h3l1.5-2h7L17 7h3v12H4z" />
+                  <circle cx="12" cy="13" r="3.5" />
+                </svg>
+                Camera
+              </button>
+              <button class="photo-button" type="button" @click="galleryInput?.click()">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                  <circle cx="9" cy="9" r="1.5" />
+                  <path d="m20 15-5-5L5 20" />
+                </svg>
+                Library
+              </button>
+              <input
+                ref="cameraInput"
+                class="visually-hidden"
+                type="file"
+                accept="image/*"
+                capture="environment"
+                @change="handlePhotoSelection"
+              />
+              <input
+                ref="galleryInput"
+                class="visually-hidden"
+                type="file"
+                accept="image/*"
+                multiple
+                @change="handlePhotoSelection"
+              />
+            </div>
+          </div>
+
+          <div v-if="form.photos.length" class="photo-previews">
+            <div v-for="(photo, index) in form.photos" :key="photo.id" class="photo-preview">
+              <img :src="photoUrl(photo)" alt="Selected photo preview" />
+              <button type="button" :aria-label="`Remove photo ${index + 1}`" @click="removePhoto(index)">×</button>
+              <span v-if="photo.status !== 'synced'" class="photo-status">{{ photo.status }}</span>
+            </div>
+          </div>
+
+          <button class="location-summary" type="button" @click="useCurrentLocation">
+            <span class="location-summary-icon" aria-hidden="true">⌖</span>
+            <span class="location-summary-text">
+              <strong>Location attached</strong>
+              <small>{{ formatCoordinate(form.lat) }}, {{ formatCoordinate(form.lng) }} · drag pin to adjust</small>
+            </span>
+            <span class="accuracy-note">{{ form.accuracyM === null ? 'Map placement' : `±${Math.round(form.accuracyM)} m` }}</span>
+          </button>
+          <p class="capture-time">Captured {{ formatDate(form.capturedAt) }}</p>
+        </div>
+
+        <div class="sheet-footer">
+          <button class="save-button" type="button" @click="savePoint">
+            {{ isEditing ? 'Save changes' : 'Save point' }}
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m5 12 4 4L19 6" />
+            </svg>
+          </button>
+        </div>
+      </section>
+    </Transition>
+
+    <Transition name="sheet">
+      <section
+        v-if="selectedPoint"
+        class="bottom-sheet detail-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="detail-title"
+      >
+        <div class="sheet-grabber" aria-hidden="true"></div>
+        <div class="sheet-header detail-header">
+          <div>
+            <p class="eyebrow">
+              <span class="layer-dot" :style="{ backgroundColor: layerFor(selectedPoint.layerId)?.color }"></span>
+              {{ layerFor(selectedPoint.layerId)?.name }}
+              <span class="sync-state" :class="selectedPoint.syncStatus">{{ syncDescription(selectedPoint.syncStatus) }}</span>
+            </p>
+            <h1 id="detail-title">{{ selectedPoint.title || 'Untitled observation' }}</h1>
+          </div>
+          <button class="sheet-close" type="button" aria-label="Close details" @click="closeSheet(true)">×</button>
+        </div>
+        <div class="sheet-content detail-content">
+          <p v-if="selectedPoint.description" class="detail-description">{{ selectedPoint.description }}</p>
+          <div v-if="selectedPoint.photos.length" class="detail-photos">
+            <div v-for="photo in selectedPoint.photos" :key="photo.id" class="detail-photo">
+              <img :src="photoUrl(photo)" alt="Point attachment" />
+              <button
+                v-if="photo.status === 'failed'"
+                class="retry-photo"
+                type="button"
+                @click="retryPhoto(photo.id)"
+              >
+                Retry photo
+              </button>
+            </div>
+          </div>
+          <div class="detail-meta">
+            <span class="avatar">{{ selectedPoint.author.slice(0, 1).toUpperCase() }}</span>
+            <span class="author-time">
+              <strong>{{ selectedPoint.author === currentUserId ? 'You' : selectedPoint.author }}</strong>
+              <small>{{ formatDate(selectedPoint.capturedAt) }}</small>
+            </span>
+          </div>
+          <p class="coordinates">
+            {{ formatCoordinate(selectedPoint.lat) }}°,
+            {{ formatCoordinate(selectedPoint.lng) }}°
+            <span v-if="selectedPoint.accuracyM !== null"> · ±{{ Math.round(selectedPoint.accuracyM) }} m accuracy</span>
+          </p>
+          <div v-if="selectedPoint.syncStatus === 'conflict'" class="conflict-panel">
+            <strong>Conflicting changes</strong>
+            <p v-if="selectedPoint.serverShadow">
+              Server version: {{ selectedPoint.serverShadow.title || 'Untitled observation' }}
+            </p>
+            <p v-else>The point was deleted on the server. Keeping yours will create it as a new point.</p>
+            <div class="conflict-actions">
+              <button type="button" @click="resolveWithServer">Use server</button>
+              <button type="button" @click="resolveWithLocal">Keep mine</button>
+            </div>
+          </div>
+        </div>
+        <div class="sheet-footer detail-footer">
+          <button
+            v-if="selectedPoint.syncStatus === 'failed'"
+            class="save-button"
+            type="button"
+            @click="retryPoint(selectedPoint.id)"
+          >
+            Retry sync
+          </button>
+          <button v-else class="save-button" type="button" @click="editPoint(selectedPoint)">
+            Edit point
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m14 5 5 5M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z" />
+            </svg>
+          </button>
+          <button
+            v-if="selectedPoint.syncStatus !== 'conflict'"
+            class="delete-button"
+            type="button"
+            aria-label="Delete point"
+            @click="deletePoint(selectedPoint)"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3" />
+            </svg>
+          </button>
+        </div>
+      </section>
+    </Transition>
+  </main>
+</template>
