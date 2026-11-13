@@ -6,8 +6,8 @@ from geoalchemy2.functions import ST_X, ST_Y
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import PhotoRecord, PointRecord, SyncEvent
-from app.schemas import PhotoOut, PointOut
+from app.models import PhotoRecord, PointEvent, PointRecord, SyncEvent
+from app.schemas import PhotoOut, PointEventCreate, PointOut
 
 
 def photo_to_out(photo: PhotoRecord) -> PhotoOut:
@@ -39,6 +39,15 @@ def point_to_out(session: Session, point: PointRecord) -> PointOut:
         lng=lng,
         title=point.title,
         description=point.description,
+        record_type=point.record_type,
+        campaign=point.campaign,
+        quantity=point.quantity,
+        status=point.status,
+        last_observed_at=point.last_observed_at,
+        removed_at=point.removed_at,
+        removal_reason=point.removal_reason,
+        removal_confidence=point.removal_confidence,
+        removal_note=point.removal_note,
         created_by=point.created_by,
         captured_at=point.captured_at,
         created_at=point.created_at,
@@ -48,6 +57,26 @@ def point_to_out(session: Session, point: PointRecord) -> PointOut:
         version=point.version,
         photos=[photo_to_out(photo) for photo in point.photos],
     )
+
+
+def add_point_event(
+    session: Session,
+    point: PointRecord,
+    event: PointEventCreate,
+    actor_id: str,
+) -> PointEvent:
+    record = PointEvent(
+        map_id=point.map_id,
+        point_id=point.id,
+        event_type=event.event_type,
+        occurred_at=event.occurred_at,
+        actor_id=actor_id,
+        removal_reason=event.removal_reason,
+        removal_confidence=event.removal_confidence,
+        note=event.note,
+    )
+    session.add(record)
+    return record
 
 
 def add_sync_event(

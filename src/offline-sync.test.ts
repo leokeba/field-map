@@ -8,6 +8,7 @@ import {
   deleteCachedWorkspace,
   deleteLocalPoint,
   initializeWorkspace,
+  recordPosterEventLocally,
   updateLocalPoint,
 } from './offline-sync'
 import type { FieldLayer, FieldMap, FieldPoint, StoredPhoto } from './types'
@@ -27,6 +28,15 @@ function makePoint(overrides: Partial<FieldPoint> = {}): FieldPoint {
     layerId: 'layer-1',
     lat: 51.5,
     lng: -0.12,
+    recordType: 'poster',
+    campaign: '',
+    quantity: 1,
+    status: 'active',
+    lastObservedAt: null,
+    removedAt: null,
+    removalReason: null,
+    removalConfidence: null,
+    removalNote: '',
     title: 'Field note',
     description: '',
     capturedAt: '2026-11-13T10:00:00.000Z',
@@ -36,6 +46,7 @@ function makePoint(overrides: Partial<FieldPoint> = {}): FieldPoint {
     version: null,
     syncStatus: 'pending',
     photos: [],
+    events: [],
     ...overrides,
   }
 }
@@ -90,6 +101,68 @@ describe('offline point queue', () => {
       expectedVersion: 4,
       status: 'pending',
     })
+  })
+
+  it('queues poster removal details with an offline point update', async () => {
+    const point = makePoint({ version: 3, syncStatus: 'synced' })
+    await offlineDb.points.put(point)
+
+    const updated = await recordPosterEventLocally(point, {
+      event_type: 'removed',
+      occurred_at: '2026-11-14T08:30:00.000Z',
+      removal_reason: 'suspected_opposition',
+      removal_confidence: 'suspected',
+      note: 'Poster was gone during a routine check.',
+    })
+
+    expect(updated.status).toBe('removed')
+    expect(updated.removedAt).toBe('2026-11-14T08:30:00.000Z')
+    expect(await offlineDb.operations.where('pointId').equals(point.id).toArray()).toMatchObject([
+      {
+        type: 'update',
+        expectedVersion: 3,
+        posterEvents: [{ event_type: 'removed', removal_reason: 'suspected_opposition' }],
+      },
+    ])
+  })
+
+  it('queues follow-up observations and updates the latest observation time', async () => {
+    const point = makePoint({ version: 2, syncStatus: 'synced' })
+    await offlineDb.points.put(point)
+
+    const updated = await recordPosterEventLocally(point, {
+      event_type: 'observed',
+      occurred_at: '2026-11-14T08:30:00.000Z',
+      note: 'Still visible.',
+    })
+
+    expect(updated.lastObservedAt).toBe('2026-11-14T08:30:00.000Z')
+    expect(await offlineDb.operations.where('pointId').equals(point.id).toArray()).toMatchObject([
+      {
+        type: 'update',
+        posterEvents: [{ event_type: 'observed', note: 'Still visible.' }],
+      },
+    ])
+  })
+
+  it('keeps offline removal with a point that has not synced yet', async () => {
+    const point = makePoint()
+    await createLocalPoint(point, [])
+
+    await recordPosterEventLocally(point, {
+      event_type: 'removed',
+      occurred_at: '2026-11-14T08:30:00.000Z',
+      removal_reason: 'unknown',
+      removal_confidence: 'unknown',
+    })
+
+    expect(await offlineDb.operations.where('pointId').equals(point.id).toArray()).toMatchObject([
+      {
+        type: 'create',
+        posterEvents: [{ event_type: 'removed', removal_reason: 'unknown' }],
+      },
+    ])
+    expect((await offlineDb.points.get(point.id))?.status).toBe('removed')
   })
 
   it('removes an unsynced point and its files without sending a delete', async () => {

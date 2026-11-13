@@ -95,6 +95,78 @@ def test_private_maps_spatial_queries_idempotency_and_conflicts(client):
     assert [event["action"] for event in events.json()] == ["created", "updated"]
 
 
+def test_poster_lifecycle_records_placement_observation_and_removal(client):
+    map_record = create_map(client)
+    headers = {"X-Dev-User": "alice"}
+    layer = client.get(
+        f"/api/maps/{map_record['id']}/layers", headers=headers
+    ).json()[0]
+    point = create_point(client, map_record, layer)
+
+    assert point["record_type"] == "poster"
+    assert point["status"] == "active"
+    assert point["quantity"] == 1
+    initial_events = client.get(f"/api/points/{point['id']}/events", headers=headers)
+    assert initial_events.status_code == 200
+    assert [event["event_type"] for event in initial_events.json()] == ["placed"]
+
+    observed_at = "2026-11-14T08:30:00Z"
+    observed = client.patch(
+        f"/api/points/{point['id']}",
+        headers=headers,
+        json={
+            "expected_version": point["version"],
+            "poster_events": [
+                {"event_type": "observed", "occurred_at": observed_at}
+            ],
+        },
+    )
+    assert observed.status_code == 200
+    assert observed.json()["last_observed_at"] == observed_at
+
+    removed_at = "2026-11-15T10:45:00Z"
+    removed = client.patch(
+        f"/api/points/{point['id']}",
+        headers=headers,
+        json={
+            "expected_version": observed.json()["version"],
+            "poster_events": [
+                {
+                    "event_type": "removed",
+                    "occurred_at": removed_at,
+                    "removal_reason": "suspected_opposition",
+                    "removal_confidence": "suspected",
+                    "note": "The poster was gone when checked.",
+                }
+            ],
+        },
+    )
+    assert removed.status_code == 200
+    assert removed.json()["status"] == "removed"
+    assert removed.json()["removed_at"] == removed_at
+
+    history = client.get(f"/api/points/{point['id']}/events", headers=headers).json()
+    assert [event["event_type"] for event in history] == [
+        "placed",
+        "observed",
+        "removed",
+    ]
+    assert history[-1]["removal_reason"] == "suspected_opposition"
+    assert history[-1]["removal_confidence"] == "suspected"
+
+    repeated_removal = client.patch(
+        f"/api/points/{point['id']}",
+        headers=headers,
+        json={
+            "expected_version": removed.json()["version"],
+            "poster_events": [
+                {"event_type": "removed", "occurred_at": removed_at}
+            ],
+        },
+    )
+    assert repeated_removal.status_code == 409
+
+
 def test_membership_roles_and_layers_protect_data(client):
     map_record = create_map(client)
     owner_headers = {"X-Dev-User": "alice"}
@@ -242,18 +314,23 @@ def test_photo_validation_storage_and_private_access(client):
     point = create_point(client, map_record, layer)
 
     image = Image.new("RGB", (800, 400), color="forestgreen")
+    exif = Image.Exif()
+    exif[270] = "Sensitive location metadata"
     image_bytes = BytesIO()
-    image.save(image_bytes, format="PNG")
+    image.save(image_bytes, format="JPEG", exif=exif)
     upload = client.post(
         "/api/points/{0}/photos".format(point["id"]),
         headers=headers,
         data={"expected_version": str(point["version"])},
-        files={"file": ("unsafe name.png", image_bytes.getvalue(), "image/png")},
+        files={"file": ("unsafe name.jpg", image_bytes.getvalue(), "image/jpeg")},
     )
     assert upload.status_code == 201
     photo = upload.json()
     assert photo["width"] == 800
-    assert photo["mime_type"] == "image/png"
+    assert photo["mime_type"] == "image/jpeg"
+    upload_dir = client.app.dependency_overrides[get_settings]().upload_dir
+    stored_image = Image.open(upload_dir / f"{UUID(photo['id']).hex}.jpg")
+    assert stored_image.getexif().get(270) is None
 
     denied = client.get(photo["url"], headers={"X-Dev-User": "bob"})
     assert denied.status_code == 404

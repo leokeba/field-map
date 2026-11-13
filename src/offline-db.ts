@@ -26,6 +26,29 @@ class FieldMapDatabase extends Dexie {
       operations: 'id, mapId, pointId, createdAt, status, nextAttemptAt',
       cursors: 'mapId',
     })
+    this.version(2)
+      .stores({
+        maps: 'id, updated_at',
+        layers: 'id, map_id',
+        points: 'id, mapId, syncStatus',
+        photos: 'id, pointId, status',
+        operations: 'id, mapId, pointId, createdAt, status, nextAttemptAt',
+        cursors: 'mapId',
+      })
+      .upgrade(async (transaction) => {
+        await transaction.table('points').toCollection().modify((point) => {
+          point.recordType ??= 'observation'
+          point.campaign ??= ''
+          point.quantity ??= 1
+          point.status ??= null
+          point.lastObservedAt ??= null
+          point.removedAt ??= null
+          point.removalReason ??= null
+          point.removalConfidence ??= null
+          point.removalNote ??= ''
+          point.events ??= []
+        })
+      })
   }
 }
 

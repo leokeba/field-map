@@ -1,4 +1,11 @@
-import type { ApiChange, ApiPoint, FieldLayer, FieldMap } from './types'
+import type {
+  ApiChange,
+  ApiPoint,
+  FieldLayer,
+  FieldMap,
+  PosterEvent,
+  PosterEventInput,
+} from './types'
 
 const apiRoot = import.meta.env.VITE_API_URL ?? '/api'
 
@@ -157,7 +164,15 @@ export function createPoint(
     | 'captured_at'
     | 'client_created_at'
     | 'location_accuracy_m'
-  >,
+    | 'record_type'
+    | 'campaign'
+    | 'quantity'
+    | 'status'
+    | 'removed_at'
+    | 'removal_reason'
+    | 'removal_confidence'
+    | 'removal_note'
+  > & { poster_events: PosterEventInput[] },
 ): Promise<ApiPoint> {
   return request(`/maps/${mapId}/points`, {
     method: 'POST',
@@ -169,10 +184,22 @@ export function updatePoint(
   point: Pick<
     ApiPoint,
     'id' | 'layer_id' | 'lat' | 'lng' | 'title' | 'description' | 'captured_at' | 'location_accuracy_m'
+    | 'campaign' | 'quantity'
   >,
   expectedVersion: number,
+  posterEvents: PosterEventInput[] = [],
 ): Promise<ApiPoint> {
-  const { layer_id, lat, lng, title, description, captured_at, location_accuracy_m } = point
+  const {
+    layer_id,
+    lat,
+    lng,
+    title,
+    description,
+    captured_at,
+    location_accuracy_m,
+    campaign,
+    quantity,
+  } = point
   return request(`/points/${point.id}`, {
     method: 'PATCH',
     body: JSON.stringify({
@@ -184,6 +211,9 @@ export function updatePoint(
       description,
       captured_at,
       location_accuracy_m,
+      campaign,
+      quantity,
+      poster_events: posterEvents,
     }),
   })
 }
@@ -218,6 +248,10 @@ export function getPoint(pointId: string): Promise<ApiPoint> {
   return request(`/points/${pointId}`)
 }
 
+export function getPointEvents(pointId: string): Promise<PosterEvent[]> {
+  return request(`/points/${pointId}/events`)
+}
+
 export async function getPhotoBlob(url: string): Promise<Blob> {
   const response = await fetch(new URL(url, new URL(apiRoot, window.location.origin)).toString(), {
     headers: requestHeaders(),
@@ -239,6 +273,15 @@ export function toApiPoint(
   | 'lng'
   | 'title'
   | 'description'
+  | 'record_type'
+  | 'campaign'
+  | 'quantity'
+  | 'status'
+  | 'last_observed_at'
+  | 'removed_at'
+  | 'removal_reason'
+  | 'removal_confidence'
+  | 'removal_note'
   | 'created_by'
   | 'captured_at'
   | 'client_created_at'
@@ -254,6 +297,15 @@ export function toApiPoint(
     lng: point.lng,
     title: point.title || null,
     description: point.description || null,
+    record_type: point.recordType,
+    campaign: point.campaign || null,
+    quantity: point.quantity,
+    status: point.status,
+    last_observed_at: point.lastObservedAt,
+    removed_at: point.removedAt,
+    removal_reason: point.removalReason,
+    removal_confidence: point.removalConfidence,
+    removal_note: point.removalNote,
     created_by: point.author,
     captured_at: point.capturedAt,
     client_created_at: point.clientCreatedAt,

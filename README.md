@@ -7,6 +7,8 @@ Field Map combines an interactive map with shared layers, protected photo upload
 ## Features
 
 - Create, view, edit, and delete timestamped map observations.
+- Record poster placements with campaign and quantity, then log follow-up observations and removals with event times, reasons, confidence, and notes.
+- Review a placement's event history; poster lifecycle updates queue offline and synchronize with point edits.
 - Create and switch between maps; owners can permanently delete a map and all its data.
 - Create layers, choose where new points go, toggle layer visibility, and delete layers with their points and photos as an owner.
 - Protect maps with member roles or private links.
@@ -22,7 +24,7 @@ The repository was empty before Phase 1. There were no Community Stack conventio
 - The frontend uses Vue 3, TypeScript, Vite, and Leaflet. Leaflet was selected for the initial lightweight mobile interaction prototype; MapLibre should be reconsidered before committing to a production renderer.
 - The standalone API uses FastAPI, SQLAlchemy, Alembic, and PostgreSQL/PostGIS. The workspace does not define or assume an identity provider.
 - Authentication supports a trusted reverse proxy or anonymous map links. Development uses a local identity and a development-only identity header; production never accepts that header.
-- Photos are kept on local disk under generated names. Original files retain their EXIF metadata but require map authorization; generated thumbnails strip metadata. Storage and database are not yet wired into Community Stack backup/restore.
+- Photos are kept on local disk under generated names. The API normalizes uploaded images and strips embedded metadata before storing originals and thumbnails; both require map authorization. Storage and database are not yet wired into Community Stack backup/restore.
 - The map tile URL is configurable via `VITE_TILE_URL`. The default OpenStreetMap raster URL is for local prototyping only; choose and document a suitable provider before production.
 - Collaboration uses polling change cursors rather than a separate realtime service. Offline writes and photo uploads are queued in IndexedDB and retried.
 
@@ -49,7 +51,7 @@ The API is available at `http://127.0.0.1:8000`; the Vite app is at `http://127.
 
 Run focused validation with `cd backend && uv run pytest`, `npm test`, and `npm run build`. The API tests use the separate `fieldmap_test` database created on first database initialization; it is not the application database.
 
-The client compresses photos larger than 2 MB to a 2048-pixel maximum JPEG before queuing them. Set `VITE_PRESERVE_ORIGINALS=true` to retain the selected original. If the Vite app is opened on a phone over the local network, its `/api` requests are proxied to the local API.
+The client compresses photos larger than 2 MB to a 2048-pixel maximum JPEG before queuing them. Set `VITE_PRESERVE_ORIGINALS=true` to skip client-side compression; the API still normalizes uploaded images and strips embedded metadata before storage. If the Vite app is opened on a phone over the local network, its `/api` requests are proxied to the local API.
 
 ## Community Stack integration
 
@@ -59,7 +61,7 @@ Private URLs are bearer credentials: anyone who has a link can use its role, so 
 
 ## Current scope
 
-Phases 1–3 cover the mobile map flow, persistent map/layer/point APIs, private-map membership roles and private links, protected photo uploads, IndexedDB caching and retry queues, optimistic point creation, conflict state, and polling updates. GeoJSON, Community Stack CLI provisioning/backup integration, and identity-provider configuration remain future work.
+The mobile map flow supports timestamped poster placements, campaign and quantity capture, follow-up observations, and removal events with history. Lifecycle updates work offline and sync through the existing retry and conflict flows. GeoJSON, Community Stack CLI provisioning/backup integration, and identity-provider configuration remain future work.
 
 ## License
 

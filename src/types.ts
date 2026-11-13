@@ -45,6 +45,15 @@ export interface ApiPoint {
   lng: number
   title: string | null
   description: string | null
+  record_type: 'poster' | 'observation'
+  campaign: string | null
+  quantity: number
+  status: 'active' | 'removed' | null
+  last_observed_at: string | null
+  removed_at: string | null
+  removal_reason: RemovalReason | null
+  removal_confidence: RemovalConfidence | null
+  removal_note: string | null
   created_by: string
   captured_at: string
   created_at: string
@@ -53,6 +62,32 @@ export interface ApiPoint {
   location_accuracy_m: number | null
   version: number
   photos: ApiPhoto[]
+}
+
+export type RemovalReason =
+  | 'suspected_opposition'
+  | 'weather'
+  | 'property_owner'
+  | 'other'
+  | 'unknown'
+
+export type RemovalConfidence = 'suspected' | 'confirmed' | 'unknown'
+export type PosterEventType = 'placed' | 'observed' | 'removed'
+
+export interface PosterEventInput {
+  event_type: 'observed' | 'removed'
+  occurred_at: string
+  removal_reason?: RemovalReason | null
+  removal_confidence?: RemovalConfidence | null
+  note?: string | null
+}
+
+export interface PosterEvent extends Omit<PosterEventInput, 'event_type'> {
+  id: string
+  point_id: string
+  event_type: PosterEventType
+  recorded_at: string
+  actor_id: string
 }
 
 export interface ApiChange {
@@ -83,6 +118,16 @@ export interface FieldPoint {
   lng: number
   title: string
   description: string
+  recordType: 'poster' | 'observation'
+  campaign: string
+  quantity: number
+  status: 'active' | 'removed' | null
+  lastObservedAt: string | null
+  removedAt: string | null
+  removalReason: RemovalReason | null
+  removalConfidence: RemovalConfidence | null
+  removalNote: string | null
+  events: PosterEvent[]
   capturedAt: string
   clientCreatedAt: string
   accuracyM: number | null
@@ -113,6 +158,7 @@ export interface PendingOperation {
   type: OperationType
   expectedVersion: number | null
   photoId?: string
+  posterEvents?: PosterEventInput[]
   attempts: number
   nextAttemptAt: number
   status: 'pending' | 'conflict' | 'failed'

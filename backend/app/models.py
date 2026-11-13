@@ -116,6 +116,15 @@ class PointRecord(Base):
             name="fk_points_layer_map",
         ),
         CheckConstraint("location_accuracy_m IS NULL OR location_accuracy_m >= 0"),
+        CheckConstraint(
+            "record_type IN ('poster', 'observation')",
+            name="ck_points_record_type",
+        ),
+        CheckConstraint("quantity >= 1", name="ck_points_quantity"),
+        CheckConstraint(
+            "status IS NULL OR status IN ('active', 'removed')",
+            name="ck_points_status",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
@@ -128,6 +137,15 @@ class PointRecord(Base):
     )
     title: Mapped[Optional[str]] = mapped_column(String(120))
     description: Mapped[Optional[str]] = mapped_column(Text)
+    record_type: Mapped[str] = mapped_column(String(16), nullable=False, default="poster")
+    campaign: Mapped[Optional[str]] = mapped_column(String(160))
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[Optional[str]] = mapped_column(String(16))
+    last_observed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    removal_reason: Mapped[Optional[str]] = mapped_column(String(32))
+    removal_confidence: Mapped[Optional[str]] = mapped_column(String(16))
+    removal_note: Mapped[Optional[str]] = mapped_column(Text)
     created_by: Mapped[str] = mapped_column(String(128), nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     client_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -150,6 +168,50 @@ class PointRecord(Base):
     photos: Mapped[list["PhotoRecord"]] = relationship(
         back_populates="point", cascade="all, delete-orphan", order_by="PhotoRecord.uploaded_at"
     )
+    events: Mapped[list["PointEvent"]] = relationship(
+        back_populates="point",
+        cascade="all, delete-orphan",
+        order_by="PointEvent.recorded_at",
+    )
+
+
+class PointEvent(Base):
+    __tablename__ = "point_events"
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('placed', 'observed', 'removed')",
+            name="ck_point_events_type",
+        ),
+        CheckConstraint(
+            "removal_reason IS NULL OR removal_reason IN "
+            "('suspected_opposition', 'weather', 'property_owner', 'other', 'unknown')",
+            name="ck_point_events_removal_reason",
+        ),
+        CheckConstraint(
+            "removal_confidence IS NULL OR removal_confidence IN "
+            "('suspected', 'confirmed', 'unknown')",
+            name="ck_point_events_removal_confidence",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    map_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("maps.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    point_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("points.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    removal_reason: Mapped[Optional[str]] = mapped_column(String(32))
+    removal_confidence: Mapped[Optional[str]] = mapped_column(String(16))
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    point: Mapped[PointRecord] = relationship(back_populates="events")
 
 
 class PhotoRecord(Base):

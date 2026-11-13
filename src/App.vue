@@ -9,6 +9,7 @@ import {
   deleteLayer,
   forgetMapShareToken,
   getMapShareToken,
+  getPointEvents,
   getRememberedMapShareToken,
   mapShareUrl,
   rememberMapShareToken,
@@ -25,6 +26,7 @@ import {
   getCachedPoints,
   initializeWorkspace,
   keepLocalVersion,
+  recordPosterEventLocally,
   retryFailedPhoto,
   retryPointOperation,
   syncMap,
@@ -38,6 +40,10 @@ import type {
   FieldPoint,
   MapRole,
   PhotoReference,
+  PosterEvent,
+  PosterEventInput,
+  RemovalConfidence,
+  RemovalReason,
   StoredPhoto,
   SyncStatus,
 } from './types'
@@ -53,6 +59,9 @@ interface DraftPhoto extends PhotoReference {
 interface PointDraft {
   lat: number
   lng: number
+  recordType: 'poster' | 'observation'
+  campaign: string
+  quantity: number
   title: string
   description: string
   layerId: string
@@ -60,6 +69,13 @@ interface PointDraft {
   accuracyM: number | null
   photos: DraftPhoto[]
   removedPhotoIds: string[]
+}
+
+interface RemovalDraft {
+  occurredAt: string
+  reason: RemovalReason
+  confidence: RemovalConfidence
+  note: string
 }
 
 const layers = ref<FieldLayer[]>([])
@@ -82,6 +98,9 @@ const placementMode = ref(false)
 const form = ref<PointDraft | null>(null)
 const editingPointId = ref<string | null>(null)
 const selectedPoint = ref<FieldPoint | null>(null)
+const pointEvents = ref<PosterEvent[]>([])
+const eventHistoryLoading = ref(false)
+const removalDraft = ref<RemovalDraft | null>(null)
 const statusMessage = ref('')
 const syncLabel = ref('Connecting…')
 const photoUrls = ref<Record<string, string>>({})
@@ -94,6 +113,29 @@ const shareLinks = ref<Record<MapRole, string | null>>({
   owner: null,
   editor: null,
   viewer: null,
+})
+const removalReasons: RemovalReason[] = [
+  'suspected_opposition',
+  'weather',
+  'property_owner',
+  'other',
+  'unknown',
+]
+const removalConfidenceOptions: RemovalConfidence[] = ['suspected', 'confirmed', 'unknown']
+const capturedAtLocal = computed({
+  get: () => (form.value ? toLocalDateTimeInput(form.value.capturedAt) : ''),
+  set: (value: string) => {
+    if (form.value && value) form.value.capturedAt = new Date(value).toISOString()
+  },
+})
+const removalOccurredAtLocal = computed({
+  get: () =>
+    removalDraft.value ? toLocalDateTimeInput(removalDraft.value.occurredAt) : '',
+  set: (value: string) => {
+    if (removalDraft.value && value) {
+      removalDraft.value.occurredAt = new Date(value).toISOString()
+    }
+  },
 })
 
 const canEdit = computed(() => currentRole.value === 'owner' || currentRole.value === 'editor')
@@ -129,8 +171,15 @@ function layerFor(id: string): FieldLayer | undefined {
   return layers.value.find((layer) => layer.id === id)
 }
 
-function markerIcon(color: string, draft = false, syncStatus?: SyncStatus): L.DivIcon {
-  const markerClass = draft ? 'draft-pin' : `map-pin ${syncStatus ?? ''}`
+function markerIcon(
+  color: string,
+  draft = false,
+  syncStatus?: SyncStatus,
+  posterStatus?: FieldPoint['status'],
+): L.DivIcon {
+  const markerClass = draft
+    ? 'draft-pin'
+    : `map-pin ${syncStatus ?? ''} ${posterStatus === 'removed' ? 'removed' : ''}`
   return L.divIcon({
     className: '',
     html: `<span class="${markerClass}" style="--pin-color:${color}"></span>`,
@@ -153,14 +202,16 @@ function renderMarkers(): void {
       continue
     }
     const marker = L.marker([point.lat, point.lng], {
-      icon: markerIcon(layerFor(point.layerId)?.color ?? '#318b69', false, point.syncStatus),
+      icon: markerIcon(
+        layerFor(point.layerId)?.color ?? '#318b69',
+        false,
+        point.syncStatus,
+        point.status,
+      ),
       keyboard: true,
-      title: point.title || layerFor(point.layerId)?.name || 'Field point',
+      title: point.title || (point.recordType === 'poster' ? 'Poster placement' : 'Field point'),
     }).addTo(map)
-    marker.on('click', () => {
-      selectedPoint.value = point
-      form.value = null
-    })
+    marker.on('click', () => void openPointDetails(point))
     pointMarkers.set(point.id, marker)
   }
 }
@@ -216,6 +267,81 @@ async function refreshPointsFromStore(): Promise<void> {
   if (selectedId) {
     selectedPoint.value = loaded.find((point) => point.id === selectedId) ?? null
   }
+}
+
+async function openPointDetails(point: FieldPoint): Promise<void> {
+  selectedPoint.value = point
+  pointEvents.value = point.events ?? []
+  removalDraft.value = null
+  form.value = null
+  if (
+    point.recordType !== 'poster' ||
+    point.syncStatus !== 'synced' ||
+    !navigator.onLine
+  ) {
+    return
+  }
+
+  eventHistoryLoading.value = true
+  try {
+    const events = await getPointEvents(point.id)
+    if (selectedPoint.value?.id !== point.id) return
+    pointEvents.value = events
+    const cached = await offlineDb.points.get(point.id)
+    if (cached) await offlineDb.points.put({ ...cached, events })
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not load poster history')
+  } finally {
+    eventHistoryLoading.value = false
+  }
+}
+
+async function recordPosterEvent(event: PosterEventInput): Promise<void> {
+  const point = selectedPoint.value
+  if (!point || !canEdit.value) return
+  try {
+    const updated = await recordPosterEventLocally(point, event)
+    selectedPoint.value = updated
+    pointEvents.value = updated.events
+    removalDraft.value = null
+    await refreshPointsFromStore()
+    await updateSyncLabel()
+    showStatus(
+      navigator.onLine
+        ? 'Poster activity saved · syncing…'
+        : 'Poster activity saved on this device · will sync when online',
+    )
+    void runSync()
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not record poster activity')
+  }
+}
+
+function confirmPosterPresent(): void {
+  void recordPosterEvent({
+    event_type: 'observed',
+    occurred_at: new Date().toISOString(),
+  })
+}
+
+function startRemoval(): void {
+  removalDraft.value = {
+    occurredAt: new Date().toISOString(),
+    reason: 'unknown',
+    confidence: 'unknown',
+    note: '',
+  }
+}
+
+function saveRemoval(): void {
+  if (!removalDraft.value) return
+  void recordPosterEvent({
+    event_type: 'removed',
+    occurred_at: removalDraft.value.occurredAt,
+    removal_reason: removalDraft.value.reason,
+    removal_confidence: removalDraft.value.confidence,
+    note: removalDraft.value.note.trim() || null,
+  })
 }
 
 async function updateSyncLabel(): Promise<void> {
@@ -517,6 +643,9 @@ function beginPoint(lat: number, lng: number, accuracyM: number | null = null): 
   form.value = {
     lat,
     lng,
+    recordType: 'poster',
+    campaign: '',
+    quantity: 1,
     title: '',
     description: '',
     layerId: activeLayerId.value,
@@ -540,6 +669,9 @@ function closeSheet(force = false): boolean {
   }
   form.value = null
   selectedPoint.value = null
+  pointEvents.value = []
+  removalDraft.value = null
+  eventHistoryLoading.value = false
   editingPointId.value = null
   draftMarker?.remove()
   draftMarker = undefined
@@ -609,6 +741,9 @@ async function editPoint(point: FieldPoint): Promise<void> {
   form.value = {
     lat: point.lat,
     lng: point.lng,
+    recordType: point.recordType,
+    campaign: point.campaign,
+    quantity: point.quantity,
     title: point.title,
     description: point.description,
     layerId: point.layerId,
@@ -649,6 +784,8 @@ async function savePoint(): Promise<void> {
         ...existing,
         lat: draft.lat,
         lng: draft.lng,
+        campaign: draft.campaign.trim(),
+        quantity: draft.quantity,
         title: draft.title,
         description: draft.description,
         layerId: draft.layerId,
@@ -665,6 +802,15 @@ async function savePoint(): Promise<void> {
         layerId: draft.layerId,
         lat: draft.lat,
         lng: draft.lng,
+        recordType: draft.recordType,
+        campaign: draft.campaign.trim(),
+        quantity: draft.quantity,
+        status: draft.recordType === 'poster' ? 'active' : null,
+        lastObservedAt: draft.recordType === 'poster' ? draft.capturedAt : null,
+        removedAt: null,
+        removalReason: null,
+        removalConfidence: null,
+        removalNote: '',
         title: draft.title,
         description: draft.description,
         capturedAt: draft.capturedAt,
@@ -674,6 +820,22 @@ async function savePoint(): Promise<void> {
         version: null,
         syncStatus: 'pending',
         photos: photoReferences,
+        events:
+          draft.recordType === 'poster'
+            ? [
+                {
+                  id: crypto.randomUUID(),
+                  point_id: pointId,
+                  event_type: 'placed',
+                  occurred_at: draft.capturedAt,
+                  recorded_at: new Date().toISOString(),
+                  actor_id: currentUserId,
+                  removal_reason: null,
+                  removal_confidence: null,
+                  note: null,
+                },
+              ]
+            : [],
       }
       await createLocalPoint(point, addedPhotos)
     }
@@ -860,6 +1022,47 @@ function formatDate(value: string): string {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(new Date(value))
+}
+
+function toLocalDateTimeInput(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset())
+  return date.toISOString().slice(0, 16)
+}
+
+function posterEventLabel(event: PosterEvent): string {
+  if (event.event_type === 'placed') return 'Poster placed'
+  if (event.event_type === 'observed') return 'Still present'
+  return 'Poster removed'
+}
+
+function removalReasonLabel(reason: RemovalReason | null | undefined): string {
+  switch (reason) {
+    case 'suspected_opposition':
+      return 'Suspected opposition'
+    case 'weather':
+      return 'Weather or damage'
+    case 'property_owner':
+      return 'Property owner'
+    case 'other':
+      return 'Other'
+    default:
+      return 'Unknown'
+  }
+}
+
+function removalConfidenceLabel(
+  confidence: RemovalConfidence | null | undefined,
+): string {
+  switch (confidence) {
+    case 'confirmed':
+      return 'Confirmed'
+    case 'suspected':
+      return 'Suspected'
+    default:
+      return 'Uncertain'
+  }
 }
 
 function formatCoordinate(value: number): string {
@@ -1255,7 +1458,7 @@ onBeforeUnmount(() => {
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M12 5v14M5 12h14" />
         </svg>
-        <span>Add point</span>
+        <span>Record poster</span>
       </button>
     </div>
 
@@ -1270,15 +1473,69 @@ onBeforeUnmount(() => {
         <div class="sheet-grabber" aria-hidden="true"></div>
         <div class="sheet-header">
           <div>
-            <p class="eyebrow">{{ isEditing ? 'UPDATE OBSERVATION' : 'NEW OBSERVATION' }}</p>
-            <h1 id="editor-title">{{ isEditing ? 'Edit point' : 'Add a point' }}</h1>
+            <p class="eyebrow">
+              {{
+                form.recordType === 'poster'
+                  ? isEditing
+                    ? 'UPDATE PLACEMENT'
+                    : 'NEW POSTER PLACEMENT'
+                  : isEditing
+                    ? 'UPDATE OBSERVATION'
+                    : 'NEW OBSERVATION'
+              }}
+            </p>
+            <h1 id="editor-title">
+              {{
+                form.recordType === 'poster'
+                  ? isEditing
+                    ? 'Edit placement'
+                    : 'Record poster'
+                  : isEditing
+                    ? 'Edit observation'
+                    : 'Add observation'
+              }}
+            </h1>
           </div>
           <button class="sheet-close" type="button" aria-label="Close editor" @click="closeSheet()">×</button>
         </div>
 
         <div class="sheet-content">
-          <label class="field-label" for="point-title">Title <span>Optional</span></label>
-          <input id="point-title" v-model="form.title" class="text-input" maxlength="120" placeholder="What did you find?" />
+          <label class="field-label" for="point-title">
+            {{ form.recordType === 'poster' ? 'Label' : 'Title' }} <span>Optional</span>
+          </label>
+          <input
+            id="point-title"
+            v-model="form.title"
+            class="text-input"
+            maxlength="120"
+            :placeholder="form.recordType === 'poster' ? 'Optional short label' : 'What did you find?'"
+          />
+
+          <template v-if="form.recordType === 'poster'">
+            <label class="field-label" for="poster-campaign">
+              Campaign <span>Optional</span>
+            </label>
+            <input
+              id="poster-campaign"
+              v-model="form.campaign"
+              class="text-input"
+              maxlength="160"
+              placeholder="Campaign or message"
+            />
+            <div class="field-row quantity-row">
+              <label class="field-label" for="poster-quantity">Quantity</label>
+              <input
+                id="poster-quantity"
+                v-model.number="form.quantity"
+                class="text-input quantity-input"
+                type="number"
+                min="1"
+                max="10000"
+                step="1"
+                required
+              />
+            </div>
+          </template>
 
           <label class="field-label description-label" for="point-description">Note <span>Optional</span></label>
           <textarea
@@ -1305,8 +1562,8 @@ onBeforeUnmount(() => {
 
           <div class="photo-row">
             <div>
-              <p class="field-label">Photos <span>Optional</span></p>
-              <p class="field-help">Add a photo to help tell the story.</p>
+              <p class="field-label">Photo evidence <span>Optional</span></p>
+              <p class="field-help">Avoid including faces or identifying details.</p>
             </div>
             <div class="photo-actions">
               <button class="photo-button" type="button" @click="cameraInput?.click()">
@@ -1359,7 +1616,20 @@ onBeforeUnmount(() => {
             </span>
             <span class="accuracy-note">{{ form.accuracyM === null ? 'Map placement' : `±${Math.round(form.accuracyM)} m` }}</span>
           </button>
-          <p class="capture-time">Captured {{ formatDate(form.capturedAt) }}</p>
+          <label class="field-label capture-time-label" for="point-captured-at">
+            {{ form.recordType === 'poster' ? 'Placed at' : 'Observed at' }}
+          </label>
+          <input
+            id="point-captured-at"
+            v-model="capturedAtLocal"
+            class="text-input datetime-input"
+            type="datetime-local"
+            required
+            :disabled="isEditing"
+          />
+          <p class="field-help capture-time-help">
+            This is when it happened; the app separately records when it synced.
+          </p>
         </div>
 
         <div class="sheet-footer">
@@ -1387,14 +1657,40 @@ onBeforeUnmount(() => {
             <p class="eyebrow">
               <span class="layer-dot" :style="{ backgroundColor: layerFor(selectedPoint.layerId)?.color }"></span>
               {{ layerFor(selectedPoint.layerId)?.name }}
+              <span
+                v-if="selectedPoint.recordType === 'poster'"
+                class="poster-state"
+                :class="selectedPoint.status"
+              >
+                {{ selectedPoint.status === 'removed' ? 'Removed' : 'Active' }}
+              </span>
               <span class="sync-state" :class="selectedPoint.syncStatus">{{ syncDescription(selectedPoint.syncStatus) }}</span>
             </p>
-            <h1 id="detail-title">{{ selectedPoint.title || 'Untitled observation' }}</h1>
+            <h1 id="detail-title">
+              {{
+                selectedPoint.title ||
+                (selectedPoint.recordType === 'poster' ? 'Poster placement' : 'Untitled observation')
+              }}
+            </h1>
           </div>
           <button class="sheet-close" type="button" aria-label="Close details" @click="closeSheet(true)">×</button>
         </div>
         <div class="sheet-content detail-content">
           <p v-if="selectedPoint.description" class="detail-description">{{ selectedPoint.description }}</p>
+          <div
+            v-if="selectedPoint.recordType === 'poster'"
+            class="poster-metadata"
+          >
+            <span v-if="selectedPoint.campaign">
+              <strong>Campaign</strong>{{ selectedPoint.campaign }}
+            </span>
+            <span>
+              <strong>Quantity</strong>{{ selectedPoint.quantity }}
+            </span>
+            <span v-if="selectedPoint.lastObservedAt">
+              <strong>Last observed</strong>{{ formatDate(selectedPoint.lastObservedAt) }}
+            </span>
+          </div>
           <div v-if="selectedPoint.photos.length" class="detail-photos">
             <div v-for="photo in selectedPoint.photos" :key="photo.id" class="detail-photo">
               <img :src="photoUrl(photo)" alt="Point attachment" />
@@ -1420,6 +1716,74 @@ onBeforeUnmount(() => {
             {{ formatCoordinate(selectedPoint.lng) }}°
             <span v-if="selectedPoint.accuracyM !== null"> · ±{{ Math.round(selectedPoint.accuracyM) }} m accuracy</span>
           </p>
+          <div
+            v-if="canEdit && selectedPoint.recordType === 'poster' && selectedPoint.status === 'active'"
+            class="poster-actions"
+          >
+            <button type="button" class="poster-observe-button" @click="confirmPosterPresent">
+              Still present
+            </button>
+            <button type="button" class="poster-remove-button" @click="startRemoval">
+              Mark removed
+            </button>
+          </div>
+          <form v-if="removalDraft" class="removal-form" @submit.prevent="saveRemoval">
+            <h2>Record removal</h2>
+            <label class="field-label" for="removal-time">When was it removed?</label>
+            <input
+              id="removal-time"
+              v-model="removalOccurredAtLocal"
+              class="text-input"
+              type="datetime-local"
+              required
+            />
+            <label class="field-label" for="removal-reason">What happened?</label>
+            <select id="removal-reason" v-model="removalDraft.reason" class="text-input">
+              <option v-for="reason in removalReasons" :key="reason" :value="reason">
+                {{ removalReasonLabel(reason) }}
+              </option>
+            </select>
+            <label class="field-label" for="removal-confidence">Confidence</label>
+            <select
+              id="removal-confidence"
+              v-model="removalDraft.confidence"
+              class="text-input"
+            >
+              <option v-for="confidence in removalConfidenceOptions" :key="confidence" :value="confidence">
+                {{ removalConfidenceLabel(confidence) }}
+              </option>
+            </select>
+            <label class="field-label" for="removal-note">Note <span>Optional</span></label>
+            <textarea
+              id="removal-note"
+              v-model="removalDraft.note"
+              class="text-input description-input"
+              maxlength="2000"
+              rows="2"
+              placeholder="What did you observe?"
+            ></textarea>
+            <p class="field-help">Record observations, not identifying details about people.</p>
+            <div class="removal-form-actions">
+              <button type="button" @click="removalDraft = null">Cancel</button>
+              <button type="submit">Save removal</button>
+            </div>
+          </form>
+          <section v-if="selectedPoint.recordType === 'poster'" class="poster-history">
+            <h2>Activity</h2>
+            <p v-if="eventHistoryLoading" class="field-help">Loading activity…</p>
+            <p v-else-if="!pointEvents.length" class="field-help">No activity recorded yet.</p>
+            <article v-for="event in pointEvents" :key="event.id" class="poster-event">
+              <div>
+                <strong>{{ posterEventLabel(event) }}</strong>
+                <time :datetime="event.occurred_at">{{ formatDate(event.occurred_at) }}</time>
+              </div>
+              <p v-if="event.event_type === 'removed'">
+                {{ removalReasonLabel(event.removal_reason) }} ·
+                {{ removalConfidenceLabel(event.removal_confidence) }}
+              </p>
+              <p v-if="event.note">{{ event.note }}</p>
+            </article>
+          </section>
           <div v-if="canEdit && selectedPoint.syncStatus === 'conflict'" class="conflict-panel">
             <strong>Conflicting changes</strong>
             <p v-if="selectedPoint.serverShadow">

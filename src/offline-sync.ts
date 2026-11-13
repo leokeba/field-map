@@ -25,6 +25,8 @@ import type {
   FieldLayer,
   FieldMap,
   FieldPoint,
+  PosterEvent,
+  PosterEventInput,
   PendingOperation,
   PhotoReference,
   StoredPhoto,
@@ -61,6 +63,16 @@ function fromApiPoint(point: ApiPoint): FieldPoint {
     lng: point.lng,
     title: point.title ?? '',
     description: point.description ?? '',
+    recordType: point.record_type,
+    campaign: point.campaign ?? '',
+    quantity: point.quantity,
+    status: point.status,
+    lastObservedAt: point.last_observed_at,
+    removedAt: point.removed_at,
+    removalReason: point.removal_reason,
+    removalConfidence: point.removal_confidence,
+    removalNote: point.removal_note ?? '',
+    events: [],
     capturedAt: point.captured_at,
     clientCreatedAt: point.client_created_at ?? point.captured_at,
     accuracyM: point.location_accuracy_m,
@@ -82,6 +94,7 @@ function operation(
   type: PendingOperation['type'],
   expectedVersion: number | null,
   photoId?: string,
+  posterEvents?: PosterEventInput[],
 ): PendingOperation {
   return {
     id: crypto.randomUUID(),
@@ -90,6 +103,7 @@ function operation(
     type,
     expectedVersion,
     photoId,
+    posterEvents,
     attempts: 0,
     nextAttemptAt: 0,
     status: 'pending',
@@ -226,7 +240,7 @@ export async function cacheServerPoint(
   }
 
   const point = fromApiPoint(apiPoint)
-  await offlineDb.points.put(point)
+  await offlineDb.points.put({ ...point, events: existing?.events ?? [] })
   await cachePhotoBlobs(apiPoint)
 }
 
@@ -279,6 +293,7 @@ export async function updateLocalPoint(
   point: FieldPoint,
   addedPhotos: StoredPhoto[],
   removedPhotoIds: string[],
+  posterEvent?: PosterEventInput,
 ): Promise<void> {
   await offlineDb.transaction(
     'rw',
@@ -303,21 +318,76 @@ export async function updateLocalPoint(
         .equals(point.id)
         .toArray()
       const create = queued.find((item) => item.type === 'create' && item.status === 'pending')
-      if (!create && point.version !== null) {
+      if (create && posterEvent) {
+        await offlineDb.operations.put({
+          ...create,
+          posterEvents: [...(create.posterEvents ?? []), posterEvent],
+        })
+      } else if (!create && point.version !== null) {
         const update = queued.find((item) => item.type === 'update' && item.status === 'pending')
         if (update) {
           await offlineDb.operations.put({
             ...update,
             expectedVersion: update.expectedVersion ?? point.version,
+            posterEvents: posterEvent
+              ? [...(update.posterEvents ?? []), posterEvent]
+              : update.posterEvents,
           })
         } else {
           await offlineDb.operations.put(
-            operation(point.mapId, point.id, 'update', point.version),
+            operation(
+              point.mapId,
+              point.id,
+              'update',
+              point.version,
+              undefined,
+              posterEvent ? [posterEvent] : undefined,
+            ),
           )
         }
       }
     },
   )
+}
+
+export async function recordPosterEventLocally(
+  point: FieldPoint,
+  event: PosterEventInput,
+): Promise<FieldPoint> {
+  if (point.recordType !== 'poster' || point.status !== 'active') {
+    throw new Error('Only active poster placements can receive lifecycle events')
+  }
+  const updated: FieldPoint = {
+    ...point,
+    status: event.event_type === 'removed' ? 'removed' : 'active',
+    lastObservedAt:
+      event.event_type === 'observed' ? event.occurred_at : point.lastObservedAt,
+    removedAt: event.event_type === 'removed' ? event.occurred_at : point.removedAt,
+    removalReason:
+      event.event_type === 'removed' ? event.removal_reason ?? 'unknown' : point.removalReason,
+    removalConfidence:
+      event.event_type === 'removed'
+        ? event.removal_confidence ?? 'unknown'
+        : point.removalConfidence,
+    removalNote: event.event_type === 'removed' ? event.note ?? '' : point.removalNote,
+    events: [
+      ...(point.events ?? []),
+      {
+        id: crypto.randomUUID(),
+        point_id: point.id,
+        event_type: event.event_type,
+        occurred_at: event.occurred_at,
+        recorded_at: new Date().toISOString(),
+        actor_id: point.author,
+        removal_reason: event.removal_reason ?? null,
+        removal_confidence: event.removal_confidence ?? null,
+        note: event.note ?? null,
+      },
+    ],
+    syncStatus: 'pending',
+  }
+  await updateLocalPoint(updated, [], [], event)
+  return updated
 }
 
 export async function deleteLocalPoint(point: FieldPoint): Promise<void> {
@@ -404,20 +474,35 @@ async function processOperation(item: PendingOperation): Promise<void> {
         captured_at: point.capturedAt,
         client_created_at: point.clientCreatedAt,
         location_accuracy_m: point.accuracyM,
+        record_type: point.recordType,
+        campaign: point.campaign || null,
+        quantity: point.quantity,
+        status: point.status,
+        removed_at: point.removedAt,
+        removal_reason: point.removalReason,
+        removal_confidence: point.removalConfidence,
+        removal_note: point.removalNote || null,
+        poster_events: item.posterEvents ?? [],
       })
       await offlineDb.points.put({
         ...fromApiPoint(saved),
         photos: point.photos,
+        events: point.events,
       })
     } else if (item.type === 'update') {
       if (item.expectedVersion === null) {
         throw new Error('Queued point update is missing its base version')
       }
       const write = pointWrite(point)
-      const saved = await updatePoint(write, point.version ?? item.expectedVersion)
+      const saved = await updatePoint(
+        write,
+        point.version ?? item.expectedVersion,
+        item.posterEvents,
+      )
       await offlineDb.points.put({
         ...fromApiPoint(saved),
         photos: point.photos,
+        events: point.events,
       })
     } else if (item.type === 'delete') {
       if (item.expectedVersion === null) {

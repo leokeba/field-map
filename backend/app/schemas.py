@@ -88,6 +88,16 @@ class MemberOut(BaseModel):
     created_at: datetime
 
 
+class PointEventCreate(BaseModel):
+    event_type: Literal["observed", "removed"]
+    occurred_at: datetime
+    removal_reason: Optional[
+        Literal["suspected_opposition", "weather", "property_owner", "other", "unknown"]
+    ] = None
+    removal_confidence: Optional[Literal["suspected", "confirmed", "unknown"]] = None
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
 class PointCreate(BaseModel):
     id: UUID
     layer_id: UUID
@@ -98,6 +108,17 @@ class PointCreate(BaseModel):
     captured_at: datetime = Field(default_factory=utcnow)
     client_created_at: Optional[datetime] = None
     location_accuracy_m: Optional[float] = Field(default=None, ge=0)
+    record_type: Literal["poster", "observation"] = "poster"
+    campaign: Optional[str] = Field(default=None, max_length=160)
+    quantity: int = Field(default=1, ge=1, le=10000)
+    status: Optional[Literal["active", "removed"]] = None
+    removed_at: Optional[datetime] = None
+    removal_reason: Optional[
+        Literal["suspected_opposition", "weather", "property_owner", "other", "unknown"]
+    ] = None
+    removal_confidence: Optional[Literal["suspected", "confirmed", "unknown"]] = None
+    removal_note: Optional[str] = Field(default=None, max_length=2000)
+    poster_events: list[PointEventCreate] = Field(default_factory=list)
 
 
 class PointPatch(BaseModel):
@@ -109,6 +130,9 @@ class PointPatch(BaseModel):
     description: Optional[str] = Field(default=None, max_length=10000)
     captured_at: Optional[datetime] = None
     location_accuracy_m: Optional[float] = Field(default=None, ge=0)
+    campaign: Optional[str] = Field(default=None, max_length=160)
+    quantity: Optional[int] = Field(default=None, ge=1, le=10000)
+    poster_events: list[PointEventCreate] = Field(default_factory=list)
 
 
 class PhotoOut(BaseModel):
@@ -132,6 +156,15 @@ class PointOut(BaseModel):
     lng: float
     title: Optional[str]
     description: Optional[str]
+    record_type: Literal["poster", "observation"]
+    campaign: Optional[str]
+    quantity: int
+    status: Optional[Literal["active", "removed"]]
+    last_observed_at: Optional[datetime]
+    removed_at: Optional[datetime]
+    removal_reason: Optional[str]
+    removal_confidence: Optional[str]
+    removal_note: Optional[str]
     created_by: str
     captured_at: datetime
     created_at: datetime
@@ -140,6 +173,20 @@ class PointOut(BaseModel):
     location_accuracy_m: Optional[float]
     version: int
     photos: list[PhotoOut]
+
+
+class PointEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    point_id: UUID
+    event_type: Literal["placed", "observed", "removed"]
+    occurred_at: datetime
+    actor_id: str
+    removal_reason: Optional[str]
+    removal_confidence: Optional[str]
+    note: Optional[str]
+    recorded_at: datetime
 
 
 class SyncEventOut(BaseModel):
