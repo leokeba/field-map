@@ -20,6 +20,16 @@ def require_map_role(
     if map_record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Map not found")
 
+    if user.map_id is not None:
+        if user.map_id != map_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Map not found")
+        if ROLE_LEVEL[user.map_role or "viewer"] < ROLE_LEVEL[minimum_role]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient map role",
+            )
+        return map_record
+
     membership: Optional[MapMembership] = session.get(
         MapMembership, (map_id, user.user_id)
     )

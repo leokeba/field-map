@@ -1,7 +1,10 @@
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -18,10 +21,30 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         allow_origins=settings.allowed_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
-        allow_headers=["Content-Type", "X-Dev-User"],
+        allow_headers=[
+            "Content-Type",
+            "X-Dev-User",
+            "X-Map-Share-Token",
+            "X-Field-Map-User",
+            "X-Field-Map-Proxy-Secret",
+        ],
     )
     app.include_router(maps.router)
     app.include_router(points.router)
+
+    frontend_dir = Path(__file__).with_name("static")
+    if (frontend_dir / "index.html").is_file():
+        assets_dir = frontend_dir / "assets"
+        if assets_dir.is_dir():
+            app.mount(
+                "/assets",
+                StaticFiles(directory=assets_dir),
+                name="frontend-assets",
+            )
+
+        @app.get("/", include_in_schema=False)
+        def frontend() -> FileResponse:
+            return FileResponse(frontend_dir / "index.html")
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

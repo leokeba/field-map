@@ -1,0 +1,60 @@
+services:
+  field-map:
+    build:
+      context: ../..
+      dockerfile: deploy/community-stack/Dockerfile
+      args:
+        VITE_TILE_URL: ${FIELD_MAP_TILE_URL:-}
+    environment:
+      APP_ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://fieldmap:${FIELD_MAP_DB_PASSWORD:?Set FIELD_MAP_DB_PASSWORD in .env}@field-map-db:5432/fieldmap
+      UPLOAD_DIR: /data/uploads
+      TRUSTED_PROXY_SECRET: ${FIELD_MAP_PROXY_SECRET:-}
+      ANONYMOUS_LINKS_ENABLED: ${FIELD_MAP_ANONYMOUS_LINKS_ENABLED:-true}
+      CORS_ORIGINS: ${FIELD_MAP_ORIGIN:?Set FIELD_MAP_ORIGIN in .env}
+      MAX_UPLOAD_SIZE_BYTES: ${FIELD_MAP_MAX_UPLOAD_SIZE_BYTES:-10000000}
+    volumes:
+      - field-map-uploads:/data/uploads
+    depends_on:
+      field-map-db:
+        condition: service_healthy
+    expose:
+      - "8000"
+    networks:
+      - proxy_net
+      - field-map-db
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  field-map-db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: fieldmap
+      POSTGRES_USER: fieldmap
+      POSTGRES_PASSWORD: ${FIELD_MAP_DB_PASSWORD:?Set FIELD_MAP_DB_PASSWORD in .env}
+    volumes:
+      - field-map-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fieldmap -d fieldmap"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks:
+      - field-map-db
+    restart: unless-stopped
+
+networks:
+  proxy_net:
+    external: true
+  field-map-db:
+    internal: true
+
+volumes:
+  field-map-postgres:
+  field-map-uploads:

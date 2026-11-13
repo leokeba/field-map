@@ -1,11 +1,11 @@
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.auth import Principal, get_current_user
+from app.auth import Principal, generate_share_token, get_current_user
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.models import (
@@ -22,12 +22,14 @@ from app.schemas import (
     LayerOut,
     LayerPatch,
     MapCreate,
+    MapCreateOut,
     MapOut,
     MapPatch,
     MemberCreate,
     MemberOut,
     PointCreate,
     PointOut,
+    ShareLinkOut,
     SyncEventOut,
 )
 from app.services import add_sync_event, point_to_out, storage_path
@@ -35,46 +37,84 @@ from app.services import add_sync_event, point_to_out, storage_path
 router = APIRouter(prefix="/api", tags=["maps"])
 
 
+def _current_role(session: Session, map_id: UUID, user: Principal) -> Optional[str]:
+    if user.map_id == map_id:
+        return user.map_role
+    membership = session.get(MapMembership, (map_id, user.user_id))
+    if membership:
+        return membership.role
+    map_record = session.get(MapRecord, map_id)
+    return "viewer" if map_record and map_record.visibility == "public" else None
+
+
+def _map_out(map_record: MapRecord, role: Optional[str]) -> MapOut:
+    return MapOut.model_validate(map_record).model_copy(update={"current_role": role})
+
+
 @router.get("/maps", response_model=list[MapOut])
 def list_maps(
     session: Session = Depends(get_db),
     user: Principal = Depends(get_current_user),
-) -> list[MapRecord]:
-    return list(
-        session.scalars(
-            select(MapRecord)
-            .outerjoin(MapMembership, MapMembership.map_id == MapRecord.id)
-            .where(
-                or_(
-                    MapMembership.user_id == user.user_id,
-                    MapRecord.visibility == "public",
-                )
+) -> list[MapOut]:
+    if user.map_id is not None:
+        map_record = session.get(MapRecord, user.map_id)
+        return [_map_out(map_record, user.map_role)] if map_record else []
+
+    statement = select(MapRecord)
+    if user.is_anonymous:
+        statement = statement.where(MapRecord.visibility == "public")
+        return [
+            _map_out(map_record, "viewer")
+            for map_record in session.scalars(
+                statement.order_by(MapRecord.updated_at.desc())
             )
-            .order_by(MapRecord.updated_at.desc())
+        ]
+
+    rows = session.execute(
+        select(MapRecord, MapMembership.role)
+        .outerjoin(
+            MapMembership,
+            (MapMembership.map_id == MapRecord.id)
+            & (MapMembership.user_id == user.user_id),
         )
+        .where(
+            or_(
+                MapMembership.user_id == user.user_id,
+                MapRecord.visibility == "public",
+            )
+        )
+        .order_by(MapRecord.updated_at.desc())
     )
+    return [
+        _map_out(map_record, role or "viewer")
+        for map_record, role in rows
+    ]
 
 
-@router.post("/maps", response_model=MapOut, status_code=status.HTTP_201_CREATED)
+@router.post("/maps", response_model=MapCreateOut, status_code=status.HTTP_201_CREATED)
 def create_map(
     body: MapCreate,
     session: Session = Depends(get_db),
     user: Principal = Depends(get_current_user),
-) -> MapRecord:
+) -> MapCreateOut:
+    owner_token, owner_hash = generate_share_token()
     map_record = MapRecord(
         name=body.name.strip(),
         description=body.description,
         visibility="private",
         created_by=user.user_id,
+        owner_share_hash=owner_hash,
     )
-    map_record.memberships.append(
-        MapMembership(user_id=user.user_id, role="owner")
-    )
+    if not user.is_anonymous:
+        map_record.memberships.append(MapMembership(user_id=user.user_id, role="owner"))
     map_record.layers.append(LayerRecord(name="Observations", color="#318b69"))
     session.add(map_record)
     session.commit()
     session.refresh(map_record)
-    return map_record
+    return MapCreateOut(
+        map=_map_out(map_record, "owner"),
+        owner_share_token=owner_token,
+    )
 
 
 @router.get("/maps/{map_id}", response_model=MapOut)
@@ -82,8 +122,25 @@ def get_map(
     map_id: UUID,
     session: Session = Depends(get_db),
     user: Principal = Depends(get_current_user),
-) -> MapRecord:
-    return require_map_role(session, map_id, user)
+) -> MapOut:
+    return _map_out(require_map_role(session, map_id, user), _current_role(session, map_id, user))
+
+
+@router.post(
+    "/maps/{map_id}/share-links/{role}",
+    response_model=ShareLinkOut,
+)
+def rotate_share_link(
+    map_id: UUID,
+    role: Literal["owner", "editor", "viewer"],
+    session: Session = Depends(get_db),
+    user: Principal = Depends(get_current_user),
+) -> ShareLinkOut:
+    map_record = require_map_role(session, map_id, user, "owner")
+    token, token_hash = generate_share_token()
+    setattr(map_record, f"{role}_share_hash", token_hash)
+    session.commit()
+    return ShareLinkOut(role=role, token=token)
 
 
 @router.patch("/maps/{map_id}", response_model=MapOut)

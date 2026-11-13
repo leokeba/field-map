@@ -1,9 +1,12 @@
+export type MapRole = 'owner' | 'editor' | 'viewer'
+
 export interface FieldMap {
   id: string
   name: string
   description: string | null
   visibility: 'private' | 'public'
   created_by: string
+  current_role?: MapRole | null
   created_at: string
   updated_at: string
 }

@@ -1,7 +1,12 @@
 import 'fake-indexeddb/auto'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { offlineDb } from './offline-db'
-import { createLocalPoint, deleteLocalPoint, updateLocalPoint } from './offline-sync'
+import {
+  createLocalPoint,
+  deleteLocalPoint,
+  initializeWorkspace,
+  updateLocalPoint,
+} from './offline-sync'
 import type { FieldPoint, StoredPhoto } from './types'
 
 function makePoint(overrides: Partial<FieldPoint> = {}): FieldPoint {
@@ -26,6 +31,7 @@ function makePoint(overrides: Partial<FieldPoint> = {}): FieldPoint {
 
 describe('offline point queue', () => {
   beforeEach(async () => {
+    vi.unstubAllGlobals()
     await offlineDb.delete()
     await offlineDb.open()
   })
@@ -92,5 +98,30 @@ describe('offline point queue', () => {
     expect(await offlineDb.points.get(point.id)).toBeUndefined()
     expect(await offlineDb.photos.get(photo.id)).toBeUndefined()
     expect(await offlineDb.operations.where('pointId').equals(point.id).count()).toBe(0)
+  })
+
+  it('does not fall back to cached private data after link authentication fails', async () => {
+    await offlineDb.maps.put({
+      id: 'private-map',
+      name: 'Private map',
+      description: null,
+      visibility: 'private',
+      created_by: 'anonymous',
+      current_role: 'owner',
+      created_at: '2026-11-13T10:00:00.000Z',
+      updated_at: '2026-11-13T10:00:00.000Z',
+    })
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: true })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail: 'Invalid private map link' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+
+    await expect(initializeWorkspace()).rejects.toMatchObject({ status: 401 })
   })
 })

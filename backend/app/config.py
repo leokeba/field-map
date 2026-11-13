@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     upload_dir: Path = Path("var/uploads")
     max_upload_size_bytes: int = 10_000_000
     development_user_id: str = "local-user"
+    trusted_proxy_secret: str | None = None
+    anonymous_links_enabled: bool = False
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     @property

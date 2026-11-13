@@ -2,6 +2,12 @@
 import L, { type Map as LeafletMap, type Marker } from 'leaflet'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
+import {
+  getMapShareToken,
+  mapShareUrl,
+  rotateShareLink,
+  setMapShareToken,
+} from './api'
 import { getSyncSummary } from './offline-sync'
 import {
   createLocalPoint,
@@ -20,6 +26,7 @@ import { offlineDb } from './offline-db'
 import type {
   FieldLayer,
   FieldPoint,
+  MapRole,
   PhotoReference,
   StoredPhoto,
   SyncStatus,
@@ -48,6 +55,7 @@ interface PointDraft {
 const layers = ref<FieldLayer[]>([])
 const points = ref<FieldPoint[]>([])
 const mapId = ref<string | null>(null)
+const currentRole = ref<MapRole>('viewer')
 const activeLayerId = ref('')
 const visibleLayerIds = ref<string[]>([])
 const placementMode = ref(false)
@@ -59,7 +67,16 @@ const syncLabel = ref('Connecting…')
 const photoUrls = ref<Record<string, string>>({})
 const cameraInput = ref<HTMLInputElement | null>(null)
 const galleryInput = ref<HTMLInputElement | null>(null)
+const shareRoles: MapRole[] = ['owner', 'editor', 'viewer']
+const shareDialogOpen = ref(false)
+const shareBusy = ref(false)
+const shareLinks = ref<Record<MapRole, string | null>>({
+  owner: null,
+  editor: null,
+  viewer: null,
+})
 
+const canEdit = computed(() => currentRole.value === 'owner' || currentRole.value === 'editor')
 const activeLayer = computed(
   () =>
     layers.value.find((layer) => layer.id === activeLayerId.value) ??
@@ -239,6 +256,10 @@ async function initialize(): Promise<void> {
   try {
     const workspace = await initializeWorkspace()
     mapId.value = workspace.map.id
+    currentRole.value = workspace.map.current_role ?? 'viewer'
+    const token = getMapShareToken()
+    shareLinks.value.owner =
+      currentRole.value === 'owner' && token ? mapShareUrl(token) : null
     layers.value = workspace.layers
     if (!activeLayerId.value || !layerFor(activeLayerId.value)) {
       activeLayerId.value = workspace.layers[0].id
@@ -260,6 +281,40 @@ async function initialize(): Promise<void> {
   } catch (error) {
     syncLabel.value = 'Map unavailable'
     showStatus(error instanceof Error ? error.message : 'Could not load a map')
+  }
+}
+
+function openShareDialog(): void {
+  const token = getMapShareToken()
+  if (token) shareLinks.value.owner = mapShareUrl(token)
+  shareDialogOpen.value = true
+}
+
+async function generateShareLink(role: MapRole): Promise<void> {
+  if (!mapId.value || currentRole.value !== 'owner' || shareBusy.value) return
+  shareBusy.value = true
+  try {
+    const result = await rotateShareLink(mapId.value, role)
+    const url = mapShareUrl(result.token)
+    shareLinks.value[role] = url
+    if (role === 'owner') setMapShareToken(result.token, true)
+    showStatus(`${role[0].toUpperCase()}${role.slice(1)} link generated; the previous link is revoked`)
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not generate a private link')
+  } finally {
+    shareBusy.value = false
+  }
+}
+
+async function copyShareLink(role: MapRole): Promise<void> {
+  if (!shareLinks.value[role]) await generateShareLink(role)
+  const url = shareLinks.value[role]
+  if (!url) return
+  try {
+    await navigator.clipboard.writeText(url)
+    showStatus(`${role[0].toUpperCase()}${role.slice(1)} link copied`)
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not copy the private link')
   }
 }
 
@@ -286,6 +341,10 @@ function setDraftLocation(lat: number, lng: number, accuracyM: number | null = n
 }
 
 function beginPoint(lat: number, lng: number, accuracyM: number | null = null): void {
+  if (!canEdit.value) {
+    showStatus('This private link is view-only')
+    return
+  }
   if (!mapId.value) {
     showStatus('Connect once to load or create a map')
     return
@@ -370,6 +429,7 @@ function useCurrentLocation(): void {
 }
 
 async function editPoint(point: FieldPoint): Promise<void> {
+  if (!canEdit.value) return
   selectedPoint.value = null
   editingPointId.value = point.id
   const photos: DraftPhoto[] = await Promise.all(
@@ -399,7 +459,7 @@ async function editPoint(point: FieldPoint): Promise<void> {
 }
 
 async function savePoint(): Promise<void> {
-  if (!form.value || !mapId.value) return
+  if (!canEdit.value || !form.value || !mapId.value) return
   const draft = form.value
   const pointId = editingPointId.value ?? crypto.randomUUID()
   const photoReferences: PhotoReference[] = draft.photos.map(
@@ -466,6 +526,7 @@ async function savePoint(): Promise<void> {
 }
 
 async function deletePoint(point: FieldPoint): Promise<void> {
+  if (!canEdit.value) return
   if (!window.confirm('Delete this point?')) return
   try {
     await deleteLocalPoint(point)
@@ -671,41 +732,51 @@ onBeforeUnmount(() => {
         </span>
       </a>
 
-      <details v-if="layers.length" class="layers-menu">
-        <summary aria-label="Choose active layer and visibility">
-          <span class="layer-dot" :style="{ backgroundColor: activeLayer.color }"></span>
-          <span class="active-layer-name">{{ activeLayer.name }}</span>
-          <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true">
-            <path d="m4 6 4 4 4-4" />
-          </svg>
-        </summary>
-        <div class="layers-popover">
-          <p class="menu-heading">Add points to</p>
-          <button
-            v-for="layer in layers"
-            :key="layer.id"
-            class="layer-choice"
-            :class="{ selected: activeLayerId === layer.id }"
-            type="button"
-            @click="activeLayerId = layer.id"
-          >
-            <span class="layer-dot" :style="{ backgroundColor: layer.color }"></span>
-            <span>{{ layer.name }}</span>
-            <span v-if="activeLayerId === layer.id" class="active-check" aria-label="active">✓</span>
-          </button>
-          <div class="menu-divider"></div>
-          <p class="menu-heading">Show on map</p>
-          <label v-for="layer in layers" :key="`visible-${layer.id}`" class="visibility-choice">
-            <input
-              type="checkbox"
-              :checked="visibleLayerIds.includes(layer.id)"
-              @change="toggleLayer(layer.id)"
-            />
-            <span class="layer-dot" :style="{ backgroundColor: layer.color }"></span>
-            <span>{{ layer.name }}</span>
-          </label>
-        </div>
-      </details>
+      <div class="topbar-actions">
+        <details v-if="layers.length" class="layers-menu">
+          <summary aria-label="Choose active layer and visibility">
+            <span class="layer-dot" :style="{ backgroundColor: activeLayer.color }"></span>
+            <span class="active-layer-name">{{ activeLayer.name }}</span>
+            <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="m4 6 4 4 4-4" />
+            </svg>
+          </summary>
+          <div class="layers-popover">
+            <p class="menu-heading">Add points to</p>
+            <button
+              v-for="layer in layers"
+              :key="layer.id"
+              class="layer-choice"
+              :class="{ selected: activeLayerId === layer.id }"
+              type="button"
+              @click="activeLayerId = layer.id"
+            >
+              <span class="layer-dot" :style="{ backgroundColor: layer.color }"></span>
+              <span>{{ layer.name }}</span>
+              <span v-if="activeLayerId === layer.id" class="active-check" aria-label="active">✓</span>
+            </button>
+            <div class="menu-divider"></div>
+            <p class="menu-heading">Show on map</p>
+            <label v-for="layer in layers" :key="`visible-${layer.id}`" class="visibility-choice">
+              <input
+                type="checkbox"
+                :checked="visibleLayerIds.includes(layer.id)"
+                @change="toggleLayer(layer.id)"
+              />
+              <span class="layer-dot" :style="{ backgroundColor: layer.color }"></span>
+              <span>{{ layer.name }}</span>
+            </label>
+          </div>
+        </details>
+        <button
+          v-if="currentRole === 'owner'"
+          class="share-button"
+          type="button"
+          @click="openShareDialog"
+        >
+          Share
+        </button>
+      </div>
     </header>
 
     <div v-if="placementMode" class="placement-hint" role="status">
@@ -715,6 +786,69 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="statusMessage" class="status-toast" role="status">{{ statusMessage }}</div>
+
+    <div
+      v-if="shareDialogOpen"
+      class="share-backdrop"
+      @click.self="shareDialogOpen = false"
+    >
+      <section
+        class="share-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="share-title"
+      >
+        <div class="sheet-header">
+          <div>
+            <p class="eyebrow">PRIVATE MAP</p>
+            <h1 id="share-title">Share access</h1>
+          </div>
+          <button
+            class="sheet-close"
+            type="button"
+            aria-label="Close sharing"
+            @click="shareDialogOpen = false"
+          >×</button>
+        </div>
+        <p class="share-warning">
+          Anyone with a link can use its permissions. Keep owner links private; rotating a link revokes its previous URL.
+        </p>
+        <div class="share-link-list">
+          <div v-for="role in shareRoles" :key="role" class="share-link-row">
+            <div class="share-link-description">
+              <strong>{{ role[0].toUpperCase() }}{{ role.slice(1) }}</strong>
+              <span>
+                {{ role === 'owner' ? 'Manage this map and its links' : role === 'editor' ? 'Add and change observations' : 'View observations only' }}
+              </span>
+              <input
+                v-if="shareLinks[role]"
+                class="share-link-input"
+                type="text"
+                readonly
+                :value="shareLinks[role]"
+                :aria-label="`${role} private URL`"
+              />
+            </div>
+            <button
+              class="share-link-generate"
+              type="button"
+              :disabled="shareBusy"
+              @click="generateShareLink(role)"
+            >
+              {{ shareLinks[role] ? 'Rotate' : 'Generate' }}
+            </button>
+            <button
+              v-if="shareLinks[role]"
+              class="share-link-copy"
+              type="button"
+              @click="copyShareLink(role)"
+            >
+              Copy
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
 
     <div class="map-actions">
       <button
@@ -729,7 +863,7 @@ onBeforeUnmount(() => {
           <path d="M12 2v3m0 14v3M2 12h3m14 0h3" />
         </svg>
       </button>
-      <button class="add-point-button" type="button" :disabled="!mapId" @click="startPlacement">
+      <button class="add-point-button" type="button" :disabled="!mapId || !canEdit" @click="startPlacement">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M12 5v14M5 12h14" />
         </svg>
@@ -898,7 +1032,7 @@ onBeforeUnmount(() => {
             {{ formatCoordinate(selectedPoint.lng) }}°
             <span v-if="selectedPoint.accuracyM !== null"> · ±{{ Math.round(selectedPoint.accuracyM) }} m accuracy</span>
           </p>
-          <div v-if="selectedPoint.syncStatus === 'conflict'" class="conflict-panel">
+          <div v-if="canEdit && selectedPoint.syncStatus === 'conflict'" class="conflict-panel">
             <strong>Conflicting changes</strong>
             <p v-if="selectedPoint.serverShadow">
               Server version: {{ selectedPoint.serverShadow.title || 'Untitled observation' }}
@@ -912,21 +1046,21 @@ onBeforeUnmount(() => {
         </div>
         <div class="sheet-footer detail-footer">
           <button
-            v-if="selectedPoint.syncStatus === 'failed'"
+            v-if="canEdit && selectedPoint.syncStatus === 'failed'"
             class="save-button"
             type="button"
             @click="retryPoint(selectedPoint.id)"
           >
             Retry sync
           </button>
-          <button v-else class="save-button" type="button" @click="editPoint(selectedPoint)">
+          <button v-else-if="canEdit" class="save-button" type="button" @click="editPoint(selectedPoint)">
             Edit point
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="m14 5 5 5M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z" />
             </svg>
           </button>
           <button
-            v-if="selectedPoint.syncStatus !== 'conflict'"
+            v-if="canEdit && selectedPoint.syncStatus !== 'conflict'"
             class="delete-button"
             type="button"
             aria-label="Delete point"

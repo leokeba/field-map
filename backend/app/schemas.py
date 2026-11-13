@@ -28,8 +28,19 @@ class MapOut(BaseModel):
     description: Optional[str]
     visibility: str
     created_by: str
+    current_role: Optional[Literal["owner", "editor", "viewer"]] = None
     created_at: datetime
     updated_at: datetime
+
+
+class MapCreateOut(BaseModel):
+    map: MapOut
+    owner_share_token: str
+
+
+class ShareLinkOut(BaseModel):
+    role: Literal["owner", "editor", "viewer"]
+    token: str
 
 
 class LayerCreate(BaseModel):

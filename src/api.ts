@@ -2,6 +2,32 @@ import type { ApiChange, ApiPoint, FieldLayer, FieldMap } from './types'
 
 const apiRoot = import.meta.env.VITE_API_URL ?? '/api'
 
+function shareTokenFromLocation(): string | null {
+  if (typeof window === 'undefined') return null
+  return new URLSearchParams(window.location.hash.slice(1)).get('token')
+}
+
+let activeShareToken = shareTokenFromLocation()
+
+export function getMapShareToken(): string | null {
+  return activeShareToken
+}
+
+export function setMapShareToken(token: string | null, updateLocation = false): void {
+  activeShareToken = token
+  if (updateLocation && typeof window !== 'undefined') {
+    const url = new URL(window.location.href)
+    url.hash = token ? new URLSearchParams({ token }).toString() : ''
+    window.history.replaceState(window.history.state, '', url)
+  }
+}
+
+export function mapShareUrl(token: string): string {
+  const url = new URL(window.location.href)
+  url.hash = new URLSearchParams({ token }).toString()
+  return url.toString()
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -15,6 +41,7 @@ export class ApiError extends Error {
 
 function requestHeaders(initial?: HeadersInit): Headers {
   const headers = new Headers(initial)
+  if (activeShareToken) headers.set('X-Map-Share-Token', activeShareToken)
   if (import.meta.env.DEV) {
     headers.set('X-Dev-User', import.meta.env.VITE_DEV_USER ?? 'local-user')
   }
@@ -48,11 +75,21 @@ export function getMaps(): Promise<FieldMap[]> {
   return request('/maps')
 }
 
-export function createMap(name: string, description: string): Promise<FieldMap> {
+export function createMap(
+  name: string,
+  description: string,
+): Promise<{ map: FieldMap; owner_share_token: string }> {
   return request('/maps', {
     method: 'POST',
     body: JSON.stringify({ name, description }),
   })
+}
+
+export function rotateShareLink(
+  mapId: string,
+  role: 'owner' | 'editor' | 'viewer',
+): Promise<{ role: 'owner' | 'editor' | 'viewer'; token: string }> {
+  return request(`/maps/${mapId}/share-links/${role}`, { method: 'POST' })
 }
 
 export function getLayers(mapId: string): Promise<FieldLayer[]> {

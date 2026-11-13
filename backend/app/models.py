@@ -38,6 +38,9 @@ class MapRecord(Base):
     description: Mapped[Optional[str]] = mapped_column(Text)
     visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="private")
     created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner_share_hash: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
+    editor_share_hash: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
+    viewer_share_hash: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

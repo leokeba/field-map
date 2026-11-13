@@ -10,6 +10,7 @@ import {
   getPhotoBlob,
   getPoint,
   getPoints,
+  setMapShareToken,
   toApiPoint,
   updatePoint,
   uploadPhoto,
@@ -100,11 +101,18 @@ export async function initializeWorkspace(): Promise<Workspace> {
     try {
       const maps = await getMaps()
       map = maps[0]
-      if (!map) map = await createMap('Community survey', 'Shared field observations')
+      if (!map) {
+        const created = await createMap('Community survey', 'Shared field observations')
+        map = created.map
+        setMapShareToken(created.owner_share_token, true)
+      }
       await offlineDb.maps.put(map)
       const layers = await getLayers(map.id)
       await offlineDb.layers.bulkPut(layers)
     } catch (error) {
+      if (error instanceof ApiError && [401, 403, 404].includes(error.status)) {
+        throw error
+      }
       if (!map) throw error
     }
   }

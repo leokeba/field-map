@@ -1,0 +1,4 @@
+field-map.example.org {
+    encode zstd gzip
+    reverse_proxy field-map:8000
+}

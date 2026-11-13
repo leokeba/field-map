@@ -13,7 +13,8 @@ def create_map(client, user="alice"):
         json={"name": "Field notes"},
     )
     assert response.status_code == 201
-    return response.json()
+    created = response.json()
+    return {**created["map"], "owner_share_token": created["owner_share_token"]}
 
 
 def create_point(client, map_record, layer, user="alice", point_id=None):
@@ -193,4 +194,138 @@ def test_production_mode_does_not_accept_development_identity(client):
     response = client.get("/api/maps", headers={"X-Dev-User": "owner"})
 
     assert response.status_code == 503
-    assert response.json()["detail"] == "No production identity adapter is configured"
+    assert response.json()["detail"] == "Trusted proxy authentication is not configured"
+
+
+def test_trusted_proxy_identity_requires_valid_secret_and_user(client):
+    production_settings = Settings(
+        app_environment="production",
+        trusted_proxy_secret="proxy-secret",
+    )
+    client.app.dependency_overrides[get_settings] = lambda: production_settings
+
+    rejected = client.get(
+        "/api/maps",
+        headers={
+            "X-Field-Map-User": "alice",
+            "X-Field-Map-Proxy-Secret": "wrong-secret",
+        },
+    )
+    assert rejected.status_code == 401
+
+    accepted = client.get(
+        "/api/maps",
+        headers={
+            "X-Field-Map-User": "alice",
+            "X-Field-Map-Proxy-Secret": "proxy-secret",
+        },
+    )
+    assert accepted.status_code == 200
+    assert accepted.json() == []
+
+
+def test_trusted_proxy_identity_rejects_malformed_user_id(client):
+    production_settings = Settings(
+        app_environment="production",
+        trusted_proxy_secret="proxy-secret",
+    )
+    client.app.dependency_overrides[get_settings] = lambda: production_settings
+
+    response = client.get(
+        "/api/maps",
+        headers={
+            "X-Field-Map-User": "alice!",
+            "X-Field-Map-Proxy-Secret": "proxy-secret",
+        },
+    )
+
+    assert response.status_code == 401
+
+
+def test_anonymous_private_map_links_are_scoped_by_role_and_revocable(client):
+    anonymous_settings = Settings(
+        app_environment="production",
+        anonymous_links_enabled=True,
+    )
+    client.app.dependency_overrides[get_settings] = lambda: anonymous_settings
+
+    created = client.post("/api/maps", json={"name": "Anonymous field survey"})
+    assert created.status_code == 201
+    result = created.json()
+    map_record = result["map"]
+    owner_headers = {"X-Map-Share-Token": result["owner_share_token"]}
+
+    assert map_record["visibility"] == "private"
+    assert map_record["current_role"] == "owner"
+    assert "owner_share_hash" not in map_record
+    assert client.get("/api/maps", headers=owner_headers).json()[0]["id"] == map_record["id"]
+
+    layer = client.get(
+        f"/api/maps/{map_record['id']}/layers",
+        headers=owner_headers,
+    ).json()[0]
+    editor_link = client.post(
+        f"/api/maps/{map_record['id']}/share-links/editor",
+        headers=owner_headers,
+    )
+    assert editor_link.status_code == 200
+    editor_headers = {"X-Map-Share-Token": editor_link.json()["token"]}
+    editor_point = client.post(
+        f"/api/maps/{map_record['id']}/points",
+        headers=editor_headers,
+        json={
+            "id": str(uuid4()),
+            "layer_id": layer["id"],
+            "lat": 51.5,
+            "lng": -0.12,
+            "title": "Anonymous edit",
+        },
+    )
+    assert editor_point.status_code == 201
+
+    viewer_link = client.post(
+        f"/api/maps/{map_record['id']}/share-links/viewer",
+        headers=owner_headers,
+    )
+    assert viewer_link.status_code == 200
+    old_viewer_headers = {"X-Map-Share-Token": viewer_link.json()["token"]}
+    viewer_map = client.get("/api/maps", headers=old_viewer_headers).json()[0]
+    assert viewer_map["current_role"] == "viewer"
+    assert client.post(
+        f"/api/maps/{map_record['id']}/points",
+        headers=old_viewer_headers,
+        json={
+            "id": str(uuid4()),
+            "layer_id": layer["id"],
+            "lat": 51.5,
+            "lng": -0.12,
+            "title": "Unauthorized edit",
+        },
+    ).status_code == 403
+    assert client.post(
+        f"/api/maps/{map_record['id']}/members",
+        headers=old_viewer_headers,
+        json={"user_id": "someone", "role": "viewer"},
+    ).status_code == 403
+
+    rotated = client.post(
+        f"/api/maps/{map_record['id']}/share-links/viewer",
+        headers=owner_headers,
+    )
+    assert rotated.status_code == 200
+    assert client.get("/api/maps", headers=old_viewer_headers).status_code == 401
+    assert client.get(
+        "/api/maps",
+        headers={"X-Map-Share-Token": rotated.json()["token"]},
+    ).status_code == 200
+
+
+def test_anonymous_without_a_private_link_cannot_read_private_maps(client):
+    owner_map = create_map(client)
+    client.app.dependency_overrides[get_settings] = lambda: Settings(
+        app_environment="production",
+        anonymous_links_enabled=True,
+    )
+
+    assert client.get("/api/maps").json() == []
+    assert client.get(f"/api/maps/{owner_map['id']}").status_code == 404

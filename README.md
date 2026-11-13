@@ -7,7 +7,8 @@ Field Map combines an interactive map with shared layers, protected photo upload
 ## Features
 
 - Create, view, edit, and delete timestamped map observations.
-- Organize observations into layers and protect private maps with member roles.
+- Organize observations into layers and protect maps with member roles or private links.
+- Share separate owner, editor, and viewer links; rotate a link to revoke its previous token.
 - Attach photos with size and image-dimension limits.
 - Cache map data and queue point and photo changes locally for later synchronization.
 - Detect stale edits and expose a conflict-resolution flow.
@@ -18,7 +19,7 @@ The repository was empty before Phase 1. There were no Community Stack conventio
 
 - The frontend uses Vue 3, TypeScript, Vite, and Leaflet. Leaflet was selected for the initial lightweight mobile interaction prototype; MapLibre should be reconsidered before committing to a production renderer.
 - The standalone API uses FastAPI, SQLAlchemy, Alembic, and PostgreSQL/PostGIS. The workspace does not define or assume an identity provider.
-- Authorization is behind an identity adapter. Local development uses a fixed development identity and an explicitly development-only identity header for role testing. Production refuses requests until a real adapter is configured; it does not trust development headers.
+- Authentication supports a trusted reverse proxy or anonymous map links. Development uses a local identity and a development-only identity header; production never accepts that header.
 - Photos are kept on local disk under generated names. Original files retain their EXIF metadata but require map authorization; generated thumbnails strip metadata. Storage and database are not yet wired into Community Stack backup/restore.
 - The map tile URL is configurable via `VITE_TILE_URL`. The default OpenStreetMap raster URL is for local prototyping only; choose and document a suitable provider before production.
 - Collaboration uses polling change cursors rather than a separate realtime service. Offline writes and photo uploads are queued in IndexedDB and retried.
@@ -48,9 +49,15 @@ Run focused validation with `cd backend && uv run pytest`, `npm test`, and `npm 
 
 The client compresses photos larger than 2 MB to a 2048-pixel maximum JPEG before queuing them. Set `VITE_PRESERVE_ORIGINALS=true` to retain the selected original. If the Vite app is opened on a phone over the local network, its `/api` requests are proxied to the local API.
 
+## Community Stack integration
+
+The [Community Stack deployment guide](./deploy/community-stack/README.md) includes a production image, Compose stack, and Caddy site snippet. The default deployment allows anonymous map creation and uses private owner/editor/viewer links; no identity provider is required. Trusted-proxy identity is optional.
+
+Private URLs are bearer credentials: anyone who has a link can use its role, so share them carefully. The database stores token hashes, but the owner link is returned only when a map is created or an owner link is rotated. Rotating a link revokes the old token; it cannot erase map data already cached in a browser. Anonymous map creation should be paired with edge-level rate limiting and appropriate resource limits before public exposure.
+
 ## Current scope
 
-Phases 1–3 cover the mobile map flow, persistent map/layer/point APIs, private-map membership roles, protected photo uploads, IndexedDB caching and retry queues, optimistic point creation, conflict state, and polling updates. GeoJSON, deployment lifecycle, backups, and production identity-provider integration remain future work.
+Phases 1–3 cover the mobile map flow, persistent map/layer/point APIs, private-map membership roles and private links, protected photo uploads, IndexedDB caching and retry queues, optimistic point creation, conflict state, and polling updates. GeoJSON, Community Stack CLI provisioning/backup integration, and identity-provider configuration remain future work.
 
 ## License
 
