@@ -7,7 +7,9 @@ Field Map combines an interactive map with shared layers, protected photo upload
 ## Features
 
 - Create, view, edit, and delete timestamped map observations.
-- Organize observations into layers and protect maps with member roles or private links.
+- Create and switch between maps; owners can permanently delete a map and all its data.
+- Create layers, choose where new points go, toggle layer visibility, and delete layers with their points and photos as an owner.
+- Protect maps with member roles or private links.
 - Share separate owner, editor, and viewer links; rotate a link to revoke its previous token.
 - Attach photos with size and image-dimension limits.
 - Cache map data and queue point and photo changes locally for later synchronization.

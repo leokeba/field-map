@@ -1,5 +1,5 @@
 from io import BytesIO
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from PIL import Image
 
@@ -142,6 +142,95 @@ def test_membership_roles_and_layers_protect_data(client):
     assert client.delete(
         "/api/layers/{0}".format(layer["id"]), headers=owner_headers
     ).status_code == 409
+
+
+def test_delete_empty_layer_and_preserve_one_layer_per_map(client):
+    map_record = create_map(client)
+    headers = {"X-Dev-User": "alice"}
+    map_id = map_record["id"]
+    first_layer = client.get(
+        f"/api/maps/{map_id}/layers", headers=headers
+    ).json()[0]
+    second_layer = client.post(
+        f"/api/maps/{map_id}/layers",
+        headers=headers,
+        json={"name": "Temporary"},
+    )
+    assert second_layer.status_code == 201
+
+    assert client.delete(
+        f"/api/layers/{second_layer.json()['id']}", headers=headers
+    ).status_code == 204
+    last_layer_delete = client.delete(
+        f"/api/layers/{first_layer['id']}", headers=headers
+    )
+    assert last_layer_delete.status_code == 409
+    assert last_layer_delete.json()["detail"] == "A map must keep at least one layer"
+
+def test_delete_layer_removes_points_and_emits_sync_deletions(client):
+    map_record = create_map(client)
+    headers = {"X-Dev-User": "alice"}
+    map_id = map_record["id"]
+    first_layer = client.get(
+        f"/api/maps/{map_id}/layers", headers=headers
+    ).json()[0]
+    second_layer = client.post(
+        f"/api/maps/{map_id}/layers",
+        headers=headers,
+        json={"name": "Temporary"},
+    ).json()
+    deleted_point = create_point(client, map_record, second_layer)
+    active_point = create_point(client, map_record, second_layer)
+    image = Image.new("RGB", (32, 24), color="forestgreen")
+    image_bytes = BytesIO()
+    image.save(image_bytes, format="PNG")
+    uploaded_photo = client.post(
+        f"/api/points/{active_point['id']}/photos",
+        headers=headers,
+        data={"expected_version": str(active_point["version"])},
+        files={"file": ("layer-photo.png", image_bytes.getvalue(), "image/png")},
+    )
+    assert uploaded_photo.status_code == 201
+    upload_dir = client.app.dependency_overrides[get_settings]().upload_dir
+    photo_id = UUID(uploaded_photo.json()["id"])
+    original_file = upload_dir / f"{photo_id.hex}.png"
+    thumbnail_file = upload_dir / f"{photo_id.hex}-thumb.jpg"
+    assert original_file.is_file()
+    assert thumbnail_file.is_file()
+    assert client.delete(
+        f"/api/points/{deleted_point['id']}",
+        headers=headers,
+        params={"expected_version": deleted_point["version"]},
+    ).status_code == 204
+
+    response = client.delete(f"/api/layers/{second_layer['id']}", headers=headers)
+
+    assert response.status_code == 204
+    assert client.get(
+        f"/api/maps/{map_id}/layers", headers=headers
+    ).json() == [first_layer]
+    assert client.get(f"/api/maps/{map_id}/points", headers=headers).json() == []
+    assert not original_file.exists()
+    assert not thumbnail_file.exists()
+    changes = client.get(f"/api/maps/{map_id}/changes", headers=headers).json()
+    for point in (deleted_point, active_point):
+        point_changes = [event for event in changes if event["entity_id"] == point["id"]]
+        assert point_changes[-1]["action"] == "deleted"
+
+
+def test_delete_map_removes_its_layers_and_points(client):
+    map_record = create_map(client)
+    headers = {"X-Dev-User": "alice"}
+    layer = client.get(
+        f"/api/maps/{map_record['id']}/layers", headers=headers
+    ).json()[0]
+    create_point(client, map_record, layer)
+
+    response = client.delete(f"/api/maps/{map_record['id']}", headers=headers)
+
+    assert response.status_code == 204
+    assert client.get(f"/api/maps/{map_record['id']}", headers=headers).status_code == 404
+    assert client.get("/api/maps", headers=headers).json() == []
 
 
 def test_photo_validation_storage_and_private_access(client):

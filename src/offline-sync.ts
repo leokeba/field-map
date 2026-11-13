@@ -10,6 +10,9 @@ import {
   getPhotoBlob,
   getPoint,
   getPoints,
+  getMapShareToken,
+  getRememberedMapShareToken,
+  rememberMapShareToken,
   setMapShareToken,
   toApiPoint,
   updatePoint,
@@ -30,6 +33,7 @@ import type {
 
 export interface Workspace {
   map: FieldMap
+  maps: FieldMap[]
   layers: FieldLayer[]
 }
 
@@ -93,22 +97,48 @@ function operation(
   }
 }
 
-export async function initializeWorkspace(): Promise<Workspace> {
+export async function initializeWorkspace(selectedMapId?: string): Promise<Workspace> {
   const cachedMaps = await offlineDb.maps.orderBy('updated_at').reverse().toArray()
-  let map = cachedMaps[0]
+  let map = selectedMapId
+    ? cachedMaps.find((cachedMap) => cachedMap.id === selectedMapId)
+    : cachedMaps[0]
+  let availableMaps = cachedMaps
 
   if (navigator.onLine) {
     try {
-      const maps = await getMaps()
-      map = maps[0]
-      if (!map) {
+      const serverMaps = await getMaps()
+      if (selectedMapId) {
+        map = serverMaps.find((serverMap) => serverMap.id === selectedMapId)
+        if (!map) {
+          throw new ApiError('Map is not available', 404, 'Map is not available')
+        }
+      } else {
+        map = serverMaps[0]
+      }
+      if (!map && !selectedMapId) {
         const created = await createMap('Community survey', 'Shared field observations')
         map = created.map
         setMapShareToken(created.owner_share_token, true)
+        rememberMapShareToken(map.id, created.owner_share_token)
+        serverMaps.push(map)
       }
-      await offlineDb.maps.put(map)
-      const layers = await getLayers(map.id)
-      await offlineDb.layers.bulkPut(layers)
+      if (!map) throw new Error('No map is available')
+      const activeMap = map
+      const token = getMapShareToken()
+      if (token) rememberMapShareToken(activeMap.id, token)
+      availableMaps = [
+        ...serverMaps,
+        ...cachedMaps.filter((cachedMap) => getRememberedMapShareToken(cachedMap.id)),
+      ].filter(
+        (candidate, index, all) =>
+          all.findIndex((other) => other.id === candidate.id) === index,
+      )
+      await offlineDb.maps.put(activeMap)
+      const layers = await getLayers(activeMap.id)
+      await offlineDb.transaction('rw', offlineDb.layers, async () => {
+        await offlineDb.layers.where('map_id').equals(activeMap.id).delete()
+        await offlineDb.layers.bulkPut(layers)
+      })
     } catch (error) {
       if (error instanceof ApiError && [401, 403, 404].includes(error.status)) {
         throw error
@@ -120,11 +150,57 @@ export async function initializeWorkspace(): Promise<Workspace> {
   if (!map) throw new Error('Connect once to load or create a map before using it offline')
   const layers = await offlineDb.layers.where('map_id').equals(map.id).sortBy('sort_order')
   if (!layers.length) throw new Error('No cached layers are available for this map')
-  return { map, layers }
+  return { map, maps: availableMaps, layers }
 }
 
 export function getCachedPoints(mapId: string): Promise<FieldPoint[]> {
   return offlineDb.points.where('mapId').equals(mapId).toArray()
+}
+
+export async function deleteCachedLayerData(mapId: string, layerId: string): Promise<void> {
+  await offlineDb.transaction(
+    'rw',
+    offlineDb.layers,
+    offlineDb.points,
+    offlineDb.photos,
+    offlineDb.operations,
+    async () => {
+      const points = await offlineDb.points.where('mapId').equals(mapId).toArray()
+      for (const point of points.filter((candidate) => candidate.layerId === layerId)) {
+        await offlineDb.points.delete(point.id)
+        await offlineDb.photos.where('pointId').equals(point.id).delete()
+        await offlineDb.operations.where('pointId').equals(point.id).delete()
+      }
+      await offlineDb.layers.delete(layerId)
+    },
+  )
+}
+
+export async function deleteCachedWorkspace(mapId: string): Promise<void> {
+  await offlineDb.transaction(
+    'rw',
+    offlineDb.maps,
+    offlineDb.layers,
+    offlineDb.points,
+    offlineDb.photos,
+    offlineDb.operations,
+    async () => {
+      const points = await offlineDb.points.where('mapId').equals(mapId).toArray()
+      const operations = await offlineDb.operations.where('mapId').equals(mapId).toArray()
+      const pointIds = new Set([
+        ...points.map((point) => point.id),
+        ...operations.map((item) => item.pointId),
+      ])
+      for (const pointId of pointIds) {
+        await offlineDb.photos.where('pointId').equals(pointId).delete()
+      }
+      await offlineDb.points.where('mapId').equals(mapId).delete()
+      await offlineDb.operations.where('mapId').equals(mapId).delete()
+      await offlineDb.layers.where('map_id').equals(mapId).delete()
+      await offlineDb.maps.delete(mapId)
+    },
+  )
+  await offlineDb.cursors.delete(mapId)
 }
 
 export async function cacheServerPoint(

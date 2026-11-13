@@ -3,14 +3,23 @@ import L, { type Map as LeafletMap, type Marker } from 'leaflet'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import {
+  createMap,
+  createLayer,
+  deleteMap,
+  deleteLayer,
+  forgetMapShareToken,
   getMapShareToken,
+  getRememberedMapShareToken,
   mapShareUrl,
+  rememberMapShareToken,
   rotateShareLink,
   setMapShareToken,
 } from './api'
 import { getSyncSummary } from './offline-sync'
 import {
   createLocalPoint,
+  deleteCachedLayerData,
+  deleteCachedWorkspace,
   deleteLocalPoint,
   fetchPointsInBounds,
   getCachedPoints,
@@ -25,6 +34,7 @@ import {
 import { offlineDb } from './offline-db'
 import type {
   FieldLayer,
+  FieldMap,
   FieldPoint,
   MapRole,
   PhotoReference,
@@ -53,11 +63,21 @@ interface PointDraft {
 }
 
 const layers = ref<FieldLayer[]>([])
+const maps = ref<FieldMap[]>([])
+const currentMap = ref<FieldMap | null>(null)
 const points = ref<FieldPoint[]>([])
 const mapId = ref<string | null>(null)
 const currentRole = ref<MapRole>('viewer')
 const activeLayerId = ref('')
 const visibleLayerIds = ref<string[]>([])
+const layerFormOpen = ref(false)
+const layerBusy = ref(false)
+const mapDialogOpen = ref(false)
+const mapBusy = ref(false)
+const newMapName = ref('')
+const newMapDescription = ref('')
+const newLayerName = ref('')
+const newLayerColor = ref('#318b69')
 const placementMode = ref(false)
 const form = ref<PointDraft | null>(null)
 const editingPointId = ref<string | null>(null)
@@ -252,15 +272,33 @@ function scheduleBoundsRefresh(): void {
   }, 250)
 }
 
-async function initialize(): Promise<void> {
+function mergeMaps(...groups: FieldMap[][]): FieldMap[] {
+  const merged = new Map<string, FieldMap>()
+  for (const candidate of groups.flat()) merged.set(candidate.id, candidate)
+  return [...merged.values()].sort((left, right) =>
+    right.updated_at.localeCompare(left.updated_at),
+  )
+}
+
+async function initialize(selectedMapId?: string): Promise<boolean> {
   try {
-    const workspace = await initializeWorkspace()
+    const workspace = await initializeWorkspace(selectedMapId)
+    maps.value = mergeMaps(maps.value, workspace.maps)
+    currentMap.value = workspace.map
     mapId.value = workspace.map.id
     currentRole.value = workspace.map.current_role ?? 'viewer'
     const token = getMapShareToken()
-    shareLinks.value.owner =
-      currentRole.value === 'owner' && token ? mapShareUrl(token) : null
+    if (token) rememberMapShareToken(workspace.map.id, token)
+    shareLinks.value = {
+      owner: currentRole.value === 'owner' && token ? mapShareUrl(token) : null,
+      editor: null,
+      viewer: null,
+    }
     layers.value = workspace.layers
+    selectedPoint.value = null
+    form.value = null
+    editingPointId.value = null
+    placementMode.value = false
     if (!activeLayerId.value || !layerFor(activeLayerId.value)) {
       activeLayerId.value = workspace.layers[0].id
     }
@@ -278,9 +316,130 @@ async function initialize(): Promise<void> {
     } else {
       await updateSyncLabel()
     }
+    return true
   } catch (error) {
     syncLabel.value = 'Map unavailable'
     showStatus(error instanceof Error ? error.message : 'Could not load a map')
+    return false
+  }
+}
+
+function openMapManager(): void {
+  if (!closeSheet()) return
+  mapDialogOpen.value = true
+}
+
+async function selectMap(selectedMap: FieldMap): Promise<void> {
+  if (selectedMap.id === mapId.value || mapBusy.value) {
+    mapDialogOpen.value = false
+    return
+  }
+  const previousToken = getMapShareToken()
+  setMapShareToken(getRememberedMapShareToken(selectedMap.id), true)
+  mapBusy.value = true
+  try {
+    if (await initialize(selectedMap.id)) {
+      mapDialogOpen.value = false
+      return
+    }
+    setMapShareToken(previousToken, true)
+  } finally {
+    mapBusy.value = false
+  }
+}
+
+async function addMap(): Promise<void> {
+  const name = newMapName.value.trim()
+  if (!name || mapBusy.value) return
+  const existingMaps = maps.value
+  const previousToken = getMapShareToken()
+  mapBusy.value = true
+  try {
+    const created = await createMap(name, newMapDescription.value.trim())
+    rememberMapShareToken(created.map.id, created.owner_share_token)
+    setMapShareToken(created.owner_share_token, true)
+    maps.value = mergeMaps(existingMaps, [created.map])
+    newMapName.value = ''
+    newMapDescription.value = ''
+    if (await initialize(created.map.id)) {
+      mapDialogOpen.value = false
+      showStatus(`Map "${created.map.name}" created`)
+    } else {
+      setMapShareToken(previousToken, true)
+      showStatus(`Map "${created.map.name}" was created, but could not be opened`)
+    }
+  } catch (error) {
+    setMapShareToken(previousToken, true)
+    showStatus(error instanceof Error ? error.message : 'Could not create map')
+  } finally {
+    mapBusy.value = false
+  }
+}
+
+function clearActiveMap(): void {
+  mapId.value = null
+  currentMap.value = null
+  layers.value = []
+  points.value = []
+  selectedPoint.value = null
+  form.value = null
+  editingPointId.value = null
+  activeLayerId.value = ''
+  visibleLayerIds.value = []
+  shareLinks.value = { owner: null, editor: null, viewer: null }
+  currentRole.value = 'viewer'
+  placementMode.value = false
+  Object.values(photoUrls.value).forEach((url) => URL.revokeObjectURL(url))
+  photoUrls.value = {}
+}
+
+async function removeMap(): Promise<void> {
+  const mapToDelete = currentMap.value
+  if (!mapToDelete || currentRole.value !== 'owner' || mapBusy.value) return
+  const confirmed = window.confirm(
+    `Permanently delete "${mapToDelete.name}" and all its layers, points, photos, and private links? This cannot be undone.`,
+  )
+  if (!confirmed) return
+
+  mapBusy.value = true
+  try {
+    await deleteMap(mapToDelete.id)
+    maps.value = maps.value.filter((candidate) => candidate.id !== mapToDelete.id)
+    forgetMapShareToken(mapToDelete.id)
+    let cacheError: unknown
+    try {
+      await deleteCachedWorkspace(mapToDelete.id)
+    } catch (error) {
+      cacheError = error
+    }
+    clearActiveMap()
+    setMapShareToken(null, true)
+    if (maps.value.length) {
+      const nextMap = maps.value[0]
+      const previousToken = getMapShareToken()
+      setMapShareToken(getRememberedMapShareToken(nextMap.id), true)
+      if (await initialize(nextMap.id)) {
+        mapDialogOpen.value = false
+      } else {
+        setMapShareToken(previousToken, true)
+      }
+    } else {
+      mapDialogOpen.value = false
+      syncLabel.value = 'No map selected'
+    }
+    if (cacheError) {
+      showStatus(
+        `Map deleted, but offline data could not be cleared: ${
+          cacheError instanceof Error ? cacheError.message : 'storage error'
+        }`,
+      )
+    } else {
+      showStatus(`Map "${mapToDelete.name}" deleted`)
+    }
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not delete map')
+  } finally {
+    mapBusy.value = false
   }
 }
 
@@ -297,7 +456,10 @@ async function generateShareLink(role: MapRole): Promise<void> {
     const result = await rotateShareLink(mapId.value, role)
     const url = mapShareUrl(result.token)
     shareLinks.value[role] = url
-    if (role === 'owner') setMapShareToken(result.token, true)
+    if (role === 'owner') {
+      rememberMapShareToken(mapId.value, result.token)
+      setMapShareToken(result.token, true)
+    }
     showStatus(`${role[0].toUpperCase()}${role.slice(1)} link generated; the previous link is revoked`)
   } catch (error) {
     showStatus(error instanceof Error ? error.message : 'Could not generate a private link')
@@ -607,6 +769,92 @@ function toggleLayer(layerId: string): void {
     : [...visibleLayerIds.value, layerId]
 }
 
+function cancelLayerCreation(): void {
+  layerFormOpen.value = false
+  newLayerName.value = ''
+  newLayerColor.value = '#318b69'
+}
+
+async function addLayer(): Promise<void> {
+  const name = newLayerName.value.trim()
+  if (!mapId.value || currentRole.value !== 'owner' || !name || layerBusy.value) return
+
+  layerBusy.value = true
+  try {
+    const sortOrder = Math.max(-1, ...layers.value.map((layer) => layer.sort_order)) + 1
+    const layer = await createLayer(mapId.value, name, newLayerColor.value, sortOrder)
+    layers.value = [...layers.value, layer].sort(
+      (left, right) =>
+        left.sort_order - right.sort_order ||
+        left.created_at.localeCompare(right.created_at),
+    )
+    activeLayerId.value = layer.id
+    visibleLayerIds.value = [...new Set([...visibleLayerIds.value, layer.id])]
+    cancelLayerCreation()
+
+    try {
+      await offlineDb.layers.put(layer)
+    } catch (error) {
+      showStatus(
+        `Layer created, but could not cache it for offline use: ${
+          error instanceof Error ? error.message : 'storage error'
+        }`,
+      )
+      return
+    }
+
+    showStatus(`Layer "${layer.name}" added`)
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not add layer')
+  } finally {
+    layerBusy.value = false
+  }
+}
+
+async function removeLayer(layer: FieldLayer): Promise<void> {
+  if (!mapId.value || currentRole.value !== 'owner' || layerBusy.value) return
+  if (layers.value.length <= 1) {
+    showStatus('A map must keep at least one layer')
+    return
+  }
+  if (
+    !window.confirm(
+      `Delete "${layer.name}" and all its points and photos? This cannot be undone.`,
+    )
+  ) {
+    return
+  }
+
+  layerBusy.value = true
+  try {
+    await deleteLayer(layer.id)
+    const remainingLayers = layers.value.filter((candidate) => candidate.id !== layer.id)
+    layers.value = remainingLayers
+    points.value = points.value.filter((point) => point.layerId !== layer.id)
+    visibleLayerIds.value = visibleLayerIds.value.filter((id) => id !== layer.id)
+    if (activeLayerId.value === layer.id) activeLayerId.value = remainingLayers[0].id
+    if (form.value?.layerId === layer.id) form.value.layerId = remainingLayers[0].id
+
+    try {
+      await deleteCachedLayerData(mapId.value, layer.id)
+    } catch (error) {
+      showStatus(
+        `Layer and points deleted on the server, but cached data could not be cleared: ${
+          error instanceof Error ? error.message : 'storage error'
+        }`,
+      )
+      return
+    }
+
+    await refreshPointsFromStore()
+    showStatus(`Layer "${layer.name}" deleted`)
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not delete layer')
+  } finally {
+    layerBusy.value = false
+  }
+}
+
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
     dateStyle: 'medium',
@@ -719,7 +967,7 @@ onBeforeUnmount(() => {
     <div id="map" class="map-canvas" :class="{ 'is-placing': placementMode }"></div>
 
     <header class="topbar">
-      <a class="brand" href="#" aria-label="Field Map home" @click.prevent="closeSheet()">
+      <button class="brand map-manager-trigger" type="button" aria-label="Manage maps" @click="openMapManager">
         <span class="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none">
             <path d="M12 21s7-6.1 7-12a7 7 0 1 0-14 0c0 5.9 7 12 7 12Z" />
@@ -727,10 +975,13 @@ onBeforeUnmount(() => {
           </svg>
         </span>
         <span>
-          <strong>Field Map</strong>
+          <strong>{{ currentMap?.name ?? 'Field Map' }}</strong>
           <small>{{ syncLabel }}</small>
         </span>
-      </a>
+        <svg class="map-manager-chevron" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="m4 6 4 4 4-4" />
+        </svg>
+      </button>
 
       <div class="topbar-actions">
         <details v-if="layers.length" class="layers-menu">
@@ -743,18 +994,76 @@ onBeforeUnmount(() => {
           </summary>
           <div class="layers-popover">
             <p class="menu-heading">Add points to</p>
-            <button
-              v-for="layer in layers"
-              :key="layer.id"
-              class="layer-choice"
-              :class="{ selected: activeLayerId === layer.id }"
-              type="button"
-              @click="activeLayerId = layer.id"
-            >
-              <span class="layer-dot" :style="{ backgroundColor: layer.color }"></span>
-              <span>{{ layer.name }}</span>
-              <span v-if="activeLayerId === layer.id" class="active-check" aria-label="active">✓</span>
-            </button>
+            <div v-for="layer in layers" :key="layer.id" class="layer-choice-row">
+              <button
+                class="layer-choice"
+                :class="{ selected: activeLayerId === layer.id }"
+                type="button"
+                @click="activeLayerId = layer.id"
+              >
+                <span class="layer-dot" :style="{ backgroundColor: layer.color }"></span>
+                <span>{{ layer.name }}</span>
+                <span v-if="activeLayerId === layer.id" class="active-check" aria-label="active">✓</span>
+              </button>
+              <button
+                v-if="currentRole === 'owner'"
+                class="layer-delete-button"
+                type="button"
+                :aria-label="`Delete layer ${layer.name}`"
+                :title="`Delete ${layer.name}`"
+                :disabled="layerBusy"
+                @click.stop="removeLayer(layer)"
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M3 4.5h10M6 4.5V3h4v1.5m2 0-.5 8h-7l-.5-8m3 2v3.5m2-3.5V10" />
+                </svg>
+              </button>
+            </div>
+            <div v-if="currentRole === 'owner'" class="layer-create-section">
+              <button
+                v-if="!layerFormOpen"
+                class="layer-create-trigger"
+                type="button"
+                @click="layerFormOpen = true"
+              >
+                + Add layer
+              </button>
+              <form v-else class="layer-create-form" @submit.prevent="addLayer">
+                <input
+                  v-model="newLayerName"
+                  class="layer-name-input"
+                  type="text"
+                  maxlength="120"
+                  placeholder="Layer name"
+                  aria-label="Layer name"
+                  required
+                  autofocus
+                />
+                <div class="layer-create-actions">
+                  <input
+                    v-model="newLayerColor"
+                    class="layer-color-input"
+                    type="color"
+                    aria-label="Layer color"
+                  />
+                  <button
+                    class="layer-create-cancel"
+                    type="button"
+                    :disabled="layerBusy"
+                    @click="cancelLayerCreation"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    class="layer-create-submit"
+                    type="submit"
+                    :disabled="layerBusy || !newLayerName.trim()"
+                  >
+                    {{ layerBusy ? 'Adding…' : 'Create' }}
+                  </button>
+                </div>
+              </form>
+            </div>
             <div class="menu-divider"></div>
             <p class="menu-heading">Show on map</p>
             <label v-for="layer in layers" :key="`visible-${layer.id}`" class="visibility-choice">
@@ -786,6 +1095,85 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="statusMessage" class="status-toast" role="status">{{ statusMessage }}</div>
+
+    <div
+      v-if="mapDialogOpen"
+      class="share-backdrop"
+      @click.self="mapDialogOpen = false"
+    >
+      <section
+        class="share-dialog map-manager-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="maps-title"
+      >
+        <div class="sheet-header">
+          <div>
+            <p class="eyebrow">FIELD MAPS</p>
+            <h1 id="maps-title">Manage maps</h1>
+          </div>
+          <button
+            class="sheet-close"
+            type="button"
+            aria-label="Close map manager"
+            @click="mapDialogOpen = false"
+          >×</button>
+        </div>
+        <p class="share-warning">
+          Select a map to open it. Deleting a map permanently removes all its layers, points, photos, and private links.
+        </p>
+        <div class="map-options" aria-label="Available maps">
+          <button
+            v-for="candidate in maps"
+            :key="candidate.id"
+            class="map-option"
+            :class="{ selected: candidate.id === mapId }"
+            type="button"
+            :disabled="mapBusy"
+            @click="selectMap(candidate)"
+          >
+            <span>
+              <strong>{{ candidate.name }}</strong>
+              <small>{{ candidate.description || 'No description' }}</small>
+            </span>
+            <span class="map-option-role">{{ candidate.current_role ?? 'offline' }}</span>
+          </button>
+          <p v-if="!maps.length" class="map-list-empty">No maps available yet.</p>
+        </div>
+        <form class="map-create-form" @submit.prevent="addMap">
+          <h2>Create a map</h2>
+          <input
+            v-model="newMapName"
+            class="map-form-input"
+            type="text"
+            maxlength="160"
+            placeholder="Map name"
+            aria-label="New map name"
+            required
+          />
+          <textarea
+            v-model="newMapDescription"
+            class="map-form-input map-description-input"
+            maxlength="4000"
+            placeholder="Description (optional)"
+            aria-label="New map description"
+            rows="2"
+          ></textarea>
+          <button class="map-create-button" type="submit" :disabled="mapBusy || !newMapName.trim()">
+            {{ mapBusy ? 'Working…' : 'Create map' }}
+          </button>
+        </form>
+        <button
+          v-if="currentRole === 'owner' && currentMap"
+          class="map-delete-button"
+          type="button"
+          :disabled="mapBusy"
+          @click="removeMap"
+        >
+          Delete “{{ currentMap.name }}”
+        </button>
+      </section>
+    </div>
 
     <div
       v-if="shareDialogOpen"

@@ -8,6 +8,7 @@ function shareTokenFromLocation(): string | null {
 }
 
 let activeShareToken = shareTokenFromLocation()
+const mapShareTokens = new Map<string, string>()
 
 export function getMapShareToken(): string | null {
   return activeShareToken
@@ -20,6 +21,18 @@ export function setMapShareToken(token: string | null, updateLocation = false): 
     url.hash = token ? new URLSearchParams({ token }).toString() : ''
     window.history.replaceState(window.history.state, '', url)
   }
+}
+
+export function rememberMapShareToken(mapId: string, token: string): void {
+  mapShareTokens.set(mapId, token)
+}
+
+export function getRememberedMapShareToken(mapId: string): string | null {
+  return mapShareTokens.get(mapId) ?? null
+}
+
+export function forgetMapShareToken(mapId: string): void {
+  mapShareTokens.delete(mapId)
 }
 
 export function mapShareUrl(token: string): string {
@@ -85,6 +98,10 @@ export function createMap(
   })
 }
 
+export function deleteMap(mapId: string): Promise<void> {
+  return request(`/maps/${mapId}`, { method: 'DELETE' })
+}
+
 export function rotateShareLink(
   mapId: string,
   role: 'owner' | 'editor' | 'viewer',
@@ -94,6 +111,22 @@ export function rotateShareLink(
 
 export function getLayers(mapId: string): Promise<FieldLayer[]> {
   return request(`/maps/${mapId}/layers`)
+}
+
+export function createLayer(
+  mapId: string,
+  name: string,
+  color: string,
+  sortOrder: number,
+): Promise<FieldLayer> {
+  return request(`/maps/${mapId}/layers`, {
+    method: 'POST',
+    body: JSON.stringify({ name, color, sort_order: sortOrder }),
+  })
+}
+
+export function deleteLayer(layerId: string): Promise<void> {
+  return request(`/layers/${layerId}`, { method: 'DELETE' })
 }
 
 export function getPoints(

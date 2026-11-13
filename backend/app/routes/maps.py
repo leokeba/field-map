@@ -3,7 +3,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.auth import Principal, generate_share_token, get_current_user
 from app.config import Settings, get_settings
@@ -268,23 +268,61 @@ def delete_layer(
     layer_id: UUID,
     session: Session = Depends(get_db),
     user: Principal = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
 ) -> None:
     layer = session.get(LayerRecord, layer_id)
     if layer is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layer not found")
     require_map_role(session, layer.map_id, user, "owner")
-    point_count = session.scalar(
-        select(func.count()).select_from(PointRecord).where(
-            PointRecord.layer_id == layer_id
+    session.execute(
+        select(MapRecord.id)
+        .where(MapRecord.id == layer.map_id)
+        .with_for_update()
+    ).scalar_one()
+    layer_count = session.scalar(
+        select(func.count()).select_from(LayerRecord).where(
+            LayerRecord.map_id == layer.map_id
         )
     )
-    if point_count:
+    if layer_count <= 1:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Reassign or delete this layer's points before deleting it",
+            detail="A map must keep at least one layer",
         )
+    points = list(
+        session.scalars(
+            select(PointRecord)
+            .options(selectinload(PointRecord.photos))
+            .where(PointRecord.layer_id == layer_id)
+        )
+    )
+    photo_keys = [
+        key
+        for point in points
+        for photo in point.photos
+        for key in (photo.storage_key, photo.thumbnail_storage_key)
+    ]
+    for point in points:
+        add_sync_event(
+            session,
+            point.map_id,
+            "point",
+            point.id,
+            "deleted",
+            point.version + 1,
+            user.user_id,
+        )
+        session.delete(point)
     session.delete(layer)
     session.commit()
+    for storage_key in photo_keys:
+        try:
+            storage_path(settings.upload_dir, storage_key).unlink(missing_ok=True)
+        except OSError:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Layer deleted, but a photo file could not be removed",
+            )
 
 
 @router.get("/maps/{map_id}/points", response_model=list[PointOut])
