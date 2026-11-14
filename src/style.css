@@ -809,6 +809,244 @@ button {
   stroke-width: 2;
 }
 
+.map-primary-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: auto;
+  width: 100%;
+  max-width: 190px;
+}
+
+.map-primary-actions .add-point-button {
+  position: static;
+  width: 100%;
+  min-width: 0;
+  transform: none;
+}
+
+.map-primary-actions .add-point-button:active {
+  transform: scale(0.97);
+}
+
+.campaign-overlay {
+  position: absolute;
+  z-index: 560;
+  inset: 0;
+  background: #10150f;
+}
+
+.campaign-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+.campaign-topbar {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: calc(14px + env(safe-area-inset-top)) 16px 12px;
+  background: linear-gradient(#10150fd9, #10150f00);
+}
+
+.campaign-close {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  color: #fff;
+  background: #242c2799;
+  border: 0;
+  border-radius: 50%;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.campaign-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.campaign-eyebrow {
+  margin: 0;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.campaign-layer {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 150px;
+  padding: 5px 10px;
+  color: #fff;
+  background: #242c2799;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.campaign-layer-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+}
+
+.campaign-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: #fff;
+  background: var(--green);
+  border-radius: 50%;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.campaign-count.empty {
+  visibility: hidden;
+}
+
+.campaign-demo-badge {
+  margin-left: 8px;
+  flex: 0 0 auto;
+  padding: 5px 10px;
+  color: #141a26;
+  background: #f2c94c;
+  border-radius: 20px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+.campaign-error {
+  position: absolute;
+  z-index: 3;
+  bottom: 130px;
+  left: 50%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: min(300px, calc(100vw - 40px));
+  padding: 14px 16px;
+  color: #fff;
+  background: #242c27f2;
+  border-radius: 14px;
+  text-align: center;
+  transform: translateX(-50%);
+}
+
+.campaign-error p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.campaign-error button {
+  min-height: 38px;
+  padding: 0 16px;
+  color: #fff;
+  background: var(--green);
+  border: 0;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.campaign-bottom {
+  position: absolute;
+  z-index: 2;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px calc(18px + env(safe-area-inset-bottom));
+  background: linear-gradient(#10150f00, #10150fd9);
+}
+
+.campaign-hint {
+  max-width: 55%;
+  padding: 8px 11px;
+  color: #fff;
+  background: #242c2799;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.campaign-capture {
+  width: 88px;
+  height: 88px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: 4px solid #fff;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+.campaign-capture:active {
+  transform: scale(0.95);
+}
+
+.campaign-capture:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.campaign-capture-core {
+  width: 72px;
+  height: 72px;
+  background: #fff;
+  border-radius: 50%;
+}
+
+.campaign-flash {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  pointer-events: none;
+  background: #fff;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.campaign-flash.on {
+  opacity: 0.9;
+}
+
 .bottom-sheet {
   position: absolute;
   z-index: 1000;
@@ -1473,6 +1711,11 @@ button {
     right: 24px;
     bottom: 24px;
     left: 24px;
+  }
+
+  .map-primary-actions {
+    flex-direction: row;
+    max-width: none;
   }
 
   .leaflet-bottom {

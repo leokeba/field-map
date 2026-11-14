@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import L, { type Map as LeafletMap, type Marker } from 'leaflet'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
+import { buildCampaignPoster } from './campaign'
 import {
   createMap,
   createLayer,
@@ -106,6 +107,21 @@ const syncLabel = ref('Connecting…')
 const photoUrls = ref<Record<string, string>>({})
 const cameraInput = ref<HTMLInputElement | null>(null)
 const galleryInput = ref<HTMLInputElement | null>(null)
+const campaignMode = ref(false)
+const campaignBusy = ref(false)
+const campaignError = ref('')
+const campaignLocationError = ref('')
+const campaignPosition = ref<{
+  lat: number
+  lng: number
+  accuracyM: number | null
+  at: number
+  simulated?: boolean
+} | null>(null)
+const campaignCount = ref(0)
+const campaignFlash = ref(false)
+const campaignVideo = ref<HTMLVideoElement | null>(null)
+const campaignDemoFeed = ref(false)
 const shareRoles: MapRole[] = ['owner', 'editor', 'viewer']
 const shareDialogOpen = ref(false)
 const shareBusy = ref(false)
@@ -152,12 +168,30 @@ const formLayer = computed(
     { id: '', name: 'Layers', color: '#318b69' },
 )
 const isEditing = computed(() => editingPointId.value !== null)
+const campaignHint = computed(() => {
+  if (campaignError.value) return 'Camera unavailable — fix it below to keep recording'
+  const position = campaignPosition.value
+  if (position) {
+    const gps = position.simulated
+      ? 'demo GPS ±8 m'
+      : position.accuracyM === null
+        ? 'GPS locked'
+        : `GPS ±${Math.round(position.accuracyM)} m`
+    return `Recording to ${activeLayer.value.name} · ${gps}`
+  }
+  return campaignLocationError.value || `Recording to ${activeLayer.value.name} · locating…`
+})
 const tileUrl =
   import.meta.env.VITE_TILE_URL ??
   'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
 const currentUserId = import.meta.env.DEV
   ? import.meta.env.VITE_DEV_USER ?? 'local-user'
   : 'unknown'
+
+// Demo-only: the demo servers set VITE_DEMO_FALLBACK=1 so campaign mode can run
+// over plain HTTP (where browsers block camera and geolocation), substituting
+// a simulated live feed and a simulated GPS position around the map centre.
+const campaignDemoFallback = import.meta.env.VITE_DEMO_FALLBACK === '1'
 
 let map: LeafletMap | undefined
 let draftMarker: Marker | undefined
@@ -166,6 +200,8 @@ const pointMarkers = new Map<string, Marker>()
 let statusTimer: number | undefined
 let pollingTimer: number | undefined
 let boundsTimer: number | undefined
+let campaignStream: MediaStream | null = null
+let demoAnimFrame: number | null = null
 
 function layerFor(id: string): FieldLayer | undefined {
   return layers.value.find((layer) => layer.id === id)
@@ -425,6 +461,7 @@ async function initialize(selectedMapId?: string): Promise<boolean> {
     form.value = null
     editingPointId.value = null
     placementMode.value = false
+    closeCampaignMode()
     if (!activeLayerId.value || !layerFor(activeLayerId.value)) {
       activeLayerId.value = workspace.layers[0].id
     }
@@ -515,6 +552,7 @@ function clearActiveMap(): void {
   shareLinks.value = { owner: null, editor: null, viewer: null }
   currentRole.value = 'viewer'
   placementMode.value = false
+  closeCampaignMode()
   Object.values(photoUrls.value).forEach((url) => URL.revokeObjectURL(url))
   photoUrls.value = {}
 }
@@ -720,6 +758,360 @@ function useCurrentLocation(): void {
     },
     { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 },
   )
+}
+
+function getCurrentPosition(): Promise<GeolocationPosition> {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error('Location is not available in this browser'))
+      return
+    }
+    navigator.geolocation.getCurrentPosition(
+      resolve,
+      (error) => {
+        reject(
+          new Error(
+            error.code === error.PERMISSION_DENIED
+              ? 'Location permission was denied; allow it to record posters'
+              : 'Could not get your GPS position',
+          ),
+        )
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 },
+    )
+  })
+}
+
+async function refreshCampaignPosition(): Promise<void> {
+  if (campaignDemoFallback && (!window.isSecureContext || !navigator.geolocation)) {
+    campaignPosition.value = simulateCampaignPosition()
+    campaignLocationError.value = ''
+    return
+  }
+  try {
+    const position = await getCurrentPosition()
+    campaignPosition.value = {
+      lat: position.coords.latitude,
+      lng: position.coords.longitude,
+      accuracyM: Number.isFinite(position.coords.accuracy) ? position.coords.accuracy : null,
+      at: Date.now(),
+    }
+    campaignLocationError.value = ''
+  } catch (error) {
+    if (campaignDemoFallback) {
+      campaignPosition.value = simulateCampaignPosition()
+      campaignLocationError.value = ''
+      return
+    }
+    campaignLocationError.value = error instanceof Error ? error.message : 'Could not get your GPS position'
+  }
+}
+
+function simulateCampaignPosition(): {
+  lat: number
+  lng: number
+  accuracyM: number | null
+  at: number
+  simulated: true
+} {
+  const center = map?.getCenter() ?? { lat: 51.5072, lng: -0.1276 }
+  const jitter = () => (Math.random() - 0.5) * 0.0004
+  return {
+    lat: center.lat + jitter(),
+    lng: center.lng + jitter(),
+    accuracyM: 8,
+    at: Date.now(),
+    simulated: true,
+  }
+}
+
+function describeCameraError(error: unknown): string {
+  if (!window.isSecureContext) {
+    return 'The live camera needs a secure HTTPS connection (localhost works too).'
+  }
+  if (error instanceof DOMException) {
+    switch (error.name) {
+      case 'NotAllowedError':
+      case 'PermissionDeniedError':
+        return 'Camera permission was denied. Allow camera access, then try again.'
+      case 'NotFoundError':
+      case 'DevicesNotFoundError':
+        return 'No camera was found on this device.'
+      case 'NotReadableError':
+      case 'TrackStartError':
+        return 'The camera is busy in another app. Close it and try again.'
+      case 'NotSupportedError':
+        return 'This camera setup is not supported by this browser.'
+    }
+  }
+  return error instanceof Error && error.message ? error.message : 'The camera could not be opened.'
+}
+
+function drawDemoFrame(context: CanvasRenderingContext2D, t: number): void {
+  const width = context.canvas.width
+  const height = context.canvas.height
+  const horizon = height * 0.72
+  const sky = context.createLinearGradient(0, 0, 0, horizon)
+  sky.addColorStop(0, '#1d2b53')
+  sky.addColorStop(0.55, '#7a4a6e')
+  sky.addColorStop(1, '#e8875a')
+  context.fillStyle = sky
+  context.fillRect(0, 0, width, horizon)
+  context.fillStyle = 'rgba(255, 214, 140, 0.9)'
+  context.beginPath()
+  context.arc(width * 0.22, horizon - 30, 34, 0, Math.PI * 2)
+  context.fill()
+  for (let i = 0; i < 3; i += 1) {
+    const cloudX = ((t * (14 + i * 6) + i * 420) % (width + 320)) - 160
+    const cloudY = height * (0.14 + i * 0.09)
+    context.fillStyle = 'rgba(255, 255, 255, 0.14)'
+    context.beginPath()
+    context.ellipse(cloudX, cloudY, 90, 22, 0, 0, Math.PI * 2)
+    context.ellipse(cloudX + 70, cloudY + 10, 60, 16, 0, 0, Math.PI * 2)
+    context.fill()
+  }
+  const buildingW = width / 9
+  context.fillStyle = '#141a26'
+  for (let i = 0; i < 9; i += 1) {
+    context.fillRect(i * buildingW, horizon - (60 + ((i * 53) % 110)), buildingW - 8, 200)
+  }
+  context.fillStyle = 'rgba(255, 214, 120, 0.8)'
+  for (let i = 0; i < 9; i += 1) {
+    for (let w = 0; w < 6; w += 1) {
+      if ((i * 7 + w * 13) % 5 < 2) {
+        context.fillRect(i * buildingW + 10 + w * 22, horizon - 40 - ((i + w) % 4) * 24, 9, 12)
+      }
+    }
+  }
+  context.fillStyle = '#20242c'
+  context.fillRect(0, horizon, width, height - horizon)
+  context.strokeStyle = 'rgba(255, 255, 255, 0.5)'
+  context.lineWidth = 4
+  context.setLineDash([46, 38])
+  context.lineDashOffset = -t * 90
+  context.beginPath()
+  context.moveTo(0, height * 0.9)
+  context.lineTo(width, height * 0.9)
+  context.stroke()
+  context.setLineDash([])
+  const postX = width * 0.72
+  context.fillStyle = '#0d1017'
+  context.fillRect(postX, horizon - 330, 14, 330)
+  context.fillRect(postX - 90, horizon - 330, 104, 12)
+  const posterX = postX - 84
+  const posterY = horizon - 316
+  context.fillStyle = '#f4efe4'
+  context.fillRect(posterX, posterY, 74, 96)
+  context.fillStyle = '#318b69'
+  context.fillRect(posterX, posterY, 74, 26)
+  context.fillStyle = '#141a26'
+  context.font = '700 13px system-ui, sans-serif'
+  context.fillText('FIELD MAP', posterX + 8, posterY + 17)
+  context.font = '500 10px system-ui, sans-serif'
+  for (let line = 0; line < 4; line += 1) {
+    context.fillRect(posterX + 8, posterY + 38 + line * 14, line === 3 ? 40 : 58, 4)
+  }
+  context.strokeStyle = 'rgba(20, 26, 38, 0.85)'
+  context.lineWidth = 3
+  for (let i = 0; i < 3; i += 1) {
+    const birdX = ((t * (30 + i * 8) + i * 300) % (width + 120)) - 60
+    const birdY = height * (0.2 + i * 0.06) + Math.sin(t * 2 + i) * 8
+    const flap = Math.sin(t * 6 + i * 2) * 6
+    context.beginPath()
+    context.moveTo(birdX - 12, birdY)
+    context.quadraticCurveTo(birdX - 4, birdY - 8 - flap, birdX, birdY)
+    context.quadraticCurveTo(birdX + 4, birdY - 8 - flap, birdX + 12, birdY)
+    context.stroke()
+  }
+  if (Math.floor(t * 2) % 2 === 0) {
+    context.fillStyle = '#ff5f56'
+    context.beginPath()
+    context.arc(36, 40, 9, 0, Math.PI * 2)
+    context.fill()
+  }
+  context.fillStyle = 'rgba(255, 255, 255, 0.92)'
+  context.font = '700 18px system-ui, sans-serif'
+  context.fillText('REC', 54, 46)
+  const label = `DEMO FEED · ${new Date().toLocaleTimeString()}`
+  context.font = '600 15px system-ui, sans-serif'
+  context.fillText(label, width - 30 - context.measureText(label).width, height - 24)
+}
+
+function startDemoFeed(video: HTMLVideoElement): boolean {
+  stopDemoFeed()
+  const canvas = document.createElement('canvas')
+  canvas.width = 1280
+  canvas.height = 720
+  const context = canvas.getContext('2d')
+  if (!context) return false
+  drawDemoFrame(context, 0)
+  const stream = canvas.captureStream(30)
+  campaignStream = stream
+  video.srcObject = stream
+  void video.play().catch(() => undefined)
+  const tick = (time: number): void => {
+    drawDemoFrame(context, time / 1000)
+    demoAnimFrame = requestAnimationFrame(tick)
+  }
+  demoAnimFrame = requestAnimationFrame(tick)
+  campaignDemoFeed.value = true
+  return true
+}
+
+function stopDemoFeed(): void {
+  if (demoAnimFrame !== null) {
+    cancelAnimationFrame(demoAnimFrame)
+    demoAnimFrame = null
+  }
+  campaignDemoFeed.value = false
+}
+
+async function openCampaignCamera(): Promise<void> {
+  campaignError.value = ''
+  const video = campaignVideo.value
+  if (window.isSecureContext && navigator.mediaDevices?.getUserMedia) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false,
+      })
+      campaignStream = stream
+      if (video) {
+        video.srcObject = stream
+        await video.play().catch(() => undefined)
+      }
+      return
+    } catch (error) {
+      stopCampaignCamera()
+      if (!campaignDemoFallback || !video || !startDemoFeed(video)) {
+        campaignError.value = describeCameraError(error)
+      }
+      return
+    }
+  }
+  if (campaignDemoFallback && video && startDemoFeed(video)) return
+  campaignError.value = describeCameraError(null)
+}
+
+function stopCampaignCamera(): void {
+  stopDemoFeed()
+  campaignStream?.getTracks().forEach((track) => track.stop())
+  campaignStream = null
+  if (campaignVideo.value) campaignVideo.value.srcObject = null
+}
+
+function closeCampaignMode(): void {
+  if (!campaignMode.value) return
+  stopCampaignCamera()
+  campaignMode.value = false
+  campaignError.value = ''
+}
+
+async function startCampaignMode(): Promise<void> {
+  if (!canEdit.value) {
+    showStatus('This private link is view-only')
+    return
+  }
+  if (!mapId.value) {
+    showStatus('Connect once to load or create a map')
+    return
+  }
+  if (!closeSheet()) return
+  campaignMode.value = true
+  campaignError.value = ''
+  campaignLocationError.value = ''
+  campaignPosition.value = null
+  campaignCount.value = 0
+  await nextTick()
+  void refreshCampaignPosition()
+  void openCampaignCamera()
+}
+
+async function ensureCampaignPosition(): Promise<{ lat: number; lng: number; accuracyM: number | null }> {
+  const cached = campaignPosition.value
+  if (!cached || Date.now() - cached.at > 30_000) {
+    campaignLocationError.value = ''
+    await refreshCampaignPosition()
+  }
+  const latest = campaignPosition.value
+  if (!latest) {
+    throw new Error(campaignLocationError.value || 'No GPS position yet; try again shortly')
+  }
+  return latest
+}
+
+function captureFrame(video: HTMLVideoElement): Promise<File> {
+  return new Promise((resolve, reject) => {
+    const canvas = document.createElement('canvas')
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    const context = canvas.getContext('2d')
+    if (!context) {
+      reject(new Error('Could not capture the camera frame'))
+      return
+    }
+    context.drawImage(video, 0, 0, canvas.width, video.videoHeight)
+    const stamp = new Date().toISOString().replace(/[:.T]/g, '-')
+    canvas.toBlob(
+      (blob) =>
+        blob
+          ? resolve(new File([blob], `poster-${stamp}.jpg`, { type: 'image/jpeg' }))
+          : reject(new Error('Could not capture the camera frame')),
+      'image/jpeg',
+      0.85,
+    )
+  })
+}
+
+async function captureCampaignPoster(): Promise<void> {
+  if (campaignBusy.value || campaignError.value) return
+  const video = campaignVideo.value
+  if (!video || video.videoWidth === 0) {
+    showStatus('The camera is not ready yet')
+    return
+  }
+  if (!mapId.value || !canEdit.value) {
+    closeCampaignMode()
+    return
+  }
+  campaignBusy.value = true
+  try {
+    const position = await ensureCampaignPosition()
+    const frame = await captureFrame(video)
+    const prepared = await preparePhoto(frame)
+    const { point, photo } = buildCampaignPoster({
+      mapId: mapId.value,
+      layerId: activeLayerId.value,
+      lat: position.lat,
+      lng: position.lng,
+      accuracyM: position.accuracyM,
+      capturedAt: new Date().toISOString(),
+      author: currentUserId,
+      file: new File([prepared.blob], prepared.filename),
+    })
+    await createLocalPoint(point, [photo])
+    campaignCount.value += 1
+    campaignFlash.value = true
+    window.setTimeout(() => {
+      campaignFlash.value = false
+    }, 90)
+    await refreshPointsFromStore()
+    await updateSyncLabel()
+    showStatus(
+      navigator.onLine
+        ? 'Poster saved on this device · syncing…'
+        : 'Poster saved on this device · will sync when online',
+    )
+    void runSync()
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not record this poster')
+  } finally {
+    campaignBusy.value = false
+  }
+}
+
+function onCampaignKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape' && campaignMode.value) closeCampaignMode()
 }
 
 async function editPoint(point: FieldPoint): Promise<void> {
@@ -1152,6 +1544,7 @@ onMounted(() => {
   pollingTimer = window.setInterval(() => void runSync(), 15000)
   window.addEventListener('online', runSync)
   window.addEventListener('offline', updateSyncLabel)
+  window.addEventListener('keydown', onCampaignKeydown)
 })
 
 onBeforeUnmount(() => {
@@ -1160,6 +1553,8 @@ onBeforeUnmount(() => {
   window.clearInterval(pollingTimer)
   window.removeEventListener('online', runSync)
   window.removeEventListener('offline', updateSyncLabel)
+  window.removeEventListener('keydown', onCampaignKeydown)
+  stopCampaignCamera()
   Object.values(photoUrls.value).forEach((url) => URL.revokeObjectURL(url))
   map?.remove()
 })
@@ -1454,12 +1849,67 @@ onBeforeUnmount(() => {
           <path d="M12 2v3m0 14v3M2 12h3m14 0h3" />
         </svg>
       </button>
-      <button class="add-point-button" type="button" :disabled="!mapId || !canEdit" @click="startPlacement">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M12 5v14M5 12h14" />
-        </svg>
-        <span>Record poster</span>
-      </button>
+      <div class="map-primary-actions">
+        <button class="add-point-button" type="button" :disabled="!mapId || !canEdit" @click="startPlacement">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          <span>Record poster</span>
+        </button>
+        <button
+          class="add-point-button campaign-mode-button"
+          type="button"
+          :disabled="!mapId || !canEdit || campaignMode"
+          @click="startCampaignMode"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 8h3l2-2h6l2 2h3v11H4V8Z" />
+            <circle cx="12" cy="13" r="3.2" />
+          </svg>
+          <span>Campaign mode</span>
+        </button>
+      </div>
+    </div>
+
+    <div
+      v-if="campaignMode"
+      class="campaign-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Campaign mode camera"
+    >
+      <video ref="campaignVideo" class="campaign-video" autoplay muted playsinline></video>
+      <div class="campaign-topbar">
+        <button class="campaign-close" type="button" aria-label="Close campaign mode" @click="closeCampaignMode">
+          ×
+        </button>
+        <div class="campaign-title">
+          <p class="campaign-eyebrow">CAMPAIGN MODE</p>
+          <span class="campaign-layer">
+            <span class="campaign-layer-dot" :style="{ backgroundColor: activeLayer.color }"></span>
+            {{ activeLayer.name }}
+          </span>
+        </div>
+        <span class="campaign-count" :class="{ empty: campaignCount === 0 }">{{ campaignCount }}</span>
+        <span v-if="campaignDemoFeed" class="campaign-demo-badge">DEMO FEED</span>
+      </div>
+      <div v-if="campaignError" class="campaign-error">
+        <p>{{ campaignError }}</p>
+        <button type="button" @click="openCampaignCamera">Try camera again</button>
+      </div>
+      <div class="campaign-bottom">
+        <span class="campaign-hint" role="status">{{ campaignHint }}</span>
+        <button
+          class="campaign-capture"
+          type="button"
+          aria-label="Capture and save poster"
+          :disabled="campaignBusy"
+          @click="captureCampaignPoster"
+        >
+          <span class="campaign-capture-core"></span>
+        </button>
+      </div>
+      <div class="campaign-flash" :class="{ on: campaignFlash }"></div>
     </div>
 
     <Transition name="sheet">

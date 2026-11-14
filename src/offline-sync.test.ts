@@ -21,6 +21,11 @@ vi.mock('./api', async (importOriginal) => {
   }
 })
 
+// Node < 21 has no global `navigator`; provide one so the tests below can redefine navigator.onLine.
+if (typeof navigator === 'undefined') {
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { onLine: true } })
+}
+
 function makePoint(overrides: Partial<FieldPoint> = {}): FieldPoint {
   return {
     id: 'point-1',

@@ -8,6 +8,7 @@ Field Map combines an interactive map with shared layers, protected photo upload
 
 - Create, view, edit, and delete timestamped map observations.
 - Record poster placements with campaign and quantity, then log follow-up observations and removals with event times, reasons, confidence, and notes.
+- Run a one-tap campaign mode with a live camera view that saves a poster — photo and GPS position included — from a single capture, with repeat captures until you close it.
 - Review a placement's event history; poster lifecycle updates queue offline and synchronize with point edits.
 - Create and switch between maps; owners can permanently delete a map and all its data.
 - Create layers, choose where new points go, toggle layer visibility, and delete layers with their points and photos as an owner.
@@ -61,7 +62,7 @@ Private URLs are bearer credentials: anyone who has a link can use its role, so 
 
 ## Current scope
 
-The mobile map flow supports timestamped poster placements, campaign and quantity capture, follow-up observations, and removal events with history. Lifecycle updates work offline and sync through the existing retry and conflict flows. GeoJSON, Community Stack CLI provisioning/backup integration, and identity-provider configuration remain future work.
+The mobile map flow supports timestamped poster placements, campaign and quantity capture, one-tap live-camera campaign recording, follow-up observations, and removal events with history. Lifecycle updates work offline and sync through the existing retry and conflict flows. GeoJSON, Community Stack CLI provisioning/backup integration, and identity-provider configuration remain future work.
 
 ## License
 
