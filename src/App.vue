@@ -200,6 +200,7 @@ const pointMarkers = new Map<string, Marker>()
 let statusTimer: number | undefined
 let pollingTimer: number | undefined
 let boundsTimer: number | undefined
+let mapResizeObserver: ResizeObserver | undefined
 let campaignStream: MediaStream | null = null
 let demoAnimFrame: number | null = null
 
@@ -416,12 +417,14 @@ async function runSync(): Promise<void> {
 async function refreshVisibleBounds(): Promise<void> {
   if (!map || !mapId.value || !navigator.onLine) return
   const bounds = map.getBounds().pad(0.08)
-  await fetchPointsInBounds(mapId.value, {
-    west: Math.max(-180, bounds.getWest()),
-    south: Math.max(-90, bounds.getSouth()),
-    east: Math.min(180, bounds.getEast()),
-    north: Math.min(90, bounds.getNorth()),
-  })
+  const west = Math.max(-180, bounds.getWest())
+  const south = Math.max(-90, bounds.getSouth())
+  const east = Math.min(180, bounds.getEast())
+  const north = Math.min(90, bounds.getNorth())
+  // A zero-area box (e.g. before the map has a real size) is invalid for
+  // the API; skip rather than send a request that is bound to 400.
+  if (east - west < 1e-9 || north - south < 1e-9) return
+  await fetchPointsInBounds(mapId.value, { west, south, east, north })
   await refreshPointsFromStore()
 }
 
@@ -1535,11 +1538,23 @@ onMounted(() => {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     maxZoom: 19,
   }).addTo(map)
-  L.control.zoom({ position: 'bottomright' }).addTo(map)
+  L.control.zoom({ position: 'bottomleft' }).addTo(map)
   map.on('click', ({ latlng }) => {
     if (placementMode.value) beginPoint(latlng.lat, latlng.lng)
   })
   map.on('moveend', scheduleBoundsRefresh)
+  // Keep Leaflet's internal size in sync with the container. Mobile browsers
+  // resize the layout viewport (e.g. iOS URL bar) without a window resize,
+  // which otherwise leaves stale tiles and a degenerate getBounds().
+  const mapElement = document.getElementById('map')
+  if (mapElement && typeof ResizeObserver !== 'undefined') {
+    mapResizeObserver = new ResizeObserver(() => {
+      map?.invalidateSize()
+      scheduleBoundsRefresh()
+    })
+    mapResizeObserver.observe(mapElement)
+  }
+  window.requestAnimationFrame(() => map?.invalidateSize())
   void initialize()
   pollingTimer = window.setInterval(() => void runSync(), 15000)
   window.addEventListener('online', runSync)
@@ -1556,13 +1571,18 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onCampaignKeydown)
   stopCampaignCamera()
   Object.values(photoUrls.value).forEach((url) => URL.revokeObjectURL(url))
+  mapResizeObserver?.disconnect()
   map?.remove()
 })
 </script>
 
 <template>
   <main class="app-shell">
-    <div id="map" class="map-canvas" :class="{ 'is-placing': placementMode }"></div>
+    <div
+      id="map"
+      class="map-canvas"
+      :class="{ 'is-placing': placementMode, 'is-campaign': campaignMode }"
+    ></div>
 
     <header class="topbar">
       <button class="brand map-manager-trigger" type="button" aria-label="Manage maps" @click="openMapManager">
