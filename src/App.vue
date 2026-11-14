@@ -2,7 +2,12 @@
 import L, { type Map as LeafletMap, type Marker } from 'leaflet'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-import { buildCampaignPoster } from './campaign'
+import {
+  buildCampaignPoster,
+  CHECK_MATCH_RADIUS_M,
+  rankCheckCandidates,
+  type CheckCandidate,
+} from './campaign'
 import {
   createMap,
   createLayer,
@@ -122,6 +127,25 @@ const campaignCount = ref(0)
 const campaignFlash = ref(false)
 const campaignVideo = ref<HTMLVideoElement | null>(null)
 const campaignDemoFeed = ref(false)
+const campaignKind = ref<'place' | 'check'>('place')
+const checkStep = ref<'camera' | 'map' | 'confirm'>('camera')
+const checkDraft = ref<{
+  prepared: { blob: Blob; filename: string }
+  position: { lat: number; lng: number; accuracyM: number | null }
+  candidates: CheckCandidate[]
+  matches: CheckCandidate[]
+} | null>(null)
+const checkTarget = ref<FieldPoint | null>(null)
+const checkOutcome = ref<'still-there' | 'gone' | null>(null)
+const checkReason = ref<RemovalReason | null>(null)
+const checkNote = ref('')
+const checkPhotoUrl = ref('')
+const checkReasonOptions: RemovalReason[] = [
+  'suspected_opposition',
+  'weather',
+  'property_owner',
+  'other',
+]
 const shareRoles: MapRole[] = ['owner', 'editor', 'viewer']
 const shareDialogOpen = ref(false)
 const shareBusy = ref(false)
@@ -171,15 +195,17 @@ const isEditing = computed(() => editingPointId.value !== null)
 const campaignHint = computed(() => {
   if (campaignError.value) return 'Camera unavailable — fix it below to keep recording'
   const position = campaignPosition.value
-  if (position) {
-    const gps = position.simulated
+  const gps = position
+    ? position.simulated
       ? 'demo GPS ±8 m'
       : position.accuracyM === null
         ? 'GPS locked'
         : `GPS ±${Math.round(position.accuracyM)} m`
-    return `Recording to ${activeLayer.value.name} · ${gps}`
+    : campaignLocationError.value || 'locating…'
+  if (campaignKind.value === 'check') {
+    return `Check mode · matches within ${CHECK_MATCH_RADIUS_M} m · ${gps}`
   }
-  return campaignLocationError.value || `Recording to ${activeLayer.value.name} · locating…`
+  return `Recording to ${activeLayer.value.name} · ${gps}`
 })
 const tileUrl =
   import.meta.env.VITE_TILE_URL ??
@@ -197,6 +223,7 @@ let map: LeafletMap | undefined
 let draftMarker: Marker | undefined
 let currentLocationMarker: L.CircleMarker | undefined
 const pointMarkers = new Map<string, Marker>()
+const checkMarkers = new Map<string, Marker>()
 let statusTimer: number | undefined
 let pollingTimer: number | undefined
 let boundsTimer: number | undefined
@@ -228,8 +255,19 @@ function markerIcon(
 function renderMarkers(): void {
   if (!map) return
 
+  // During the check disambiguation step the map only shows the ranked
+  // candidates; the regular markers are restored when the step ends.
+  if (checkStep.value === 'map') {
+    checkMarkers.forEach((marker) => marker.remove())
+    checkMarkers.clear()
+    renderCheckMarkers()
+    return
+  }
+
   pointMarkers.forEach((marker) => marker.remove())
   pointMarkers.clear()
+  checkMarkers.forEach((marker) => marker.remove())
+  checkMarkers.clear()
 
   for (const point of points.value) {
     if (
@@ -1008,6 +1046,8 @@ function closeCampaignMode(): void {
   stopCampaignCamera()
   campaignMode.value = false
   campaignError.value = ''
+  campaignKind.value = 'place'
+  exitCheckToCamera()
 }
 
 async function startCampaignMode(): Promise<void> {
@@ -1025,6 +1065,11 @@ async function startCampaignMode(): Promise<void> {
   campaignLocationError.value = ''
   campaignPosition.value = null
   campaignCount.value = 0
+  campaignKind.value = 'place'
+  checkStep.value = 'camera'
+  checkDraft.value = null
+  checkTarget.value = null
+  checkPhotoUrl.value = ''
   await nextTick()
   void refreshCampaignPosition()
   void openCampaignCamera()
@@ -1113,8 +1158,246 @@ async function captureCampaignPoster(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Campaign check mode: verify an existing poster instead of placing a new one.
+// Capture → rank nearby active posters by GPS distance → confirm a single
+// auto-match on the camera → disambiguate on the map when several match (or
+// none match close enough) → record 'observed' / 'removed' with the photo.
+// ---------------------------------------------------------------------------
+
+const checkTargetDistance = computed(() => {
+  const draft = checkDraft.value
+  const target = checkTarget.value
+  if (!draft || !target) return null
+  return Math.round(draft.candidates.find((candidate) => candidate.point.id === target.id)?.distanceM ?? 0)
+})
+
+async function captureCampaignCheck(): Promise<void> {
+  if (campaignBusy.value || campaignError.value) return
+  const video = campaignVideo.value
+  if (!video || video.videoWidth === 0) {
+    showStatus('The camera is not ready yet')
+    return
+  }
+  if (!mapId.value || !canEdit.value) {
+    closeCampaignMode()
+    return
+  }
+  campaignBusy.value = true
+  try {
+    const position = await ensureCampaignPosition()
+    const frame = await captureFrame(video)
+    const prepared = await preparePhoto(frame)
+    const cached = await getCachedPoints(mapId.value)
+    const selection = rankCheckCandidates(cached, position)
+    checkDraft.value = {
+      prepared,
+      position,
+      candidates: selection.candidates,
+      matches: selection.matches,
+    }
+    checkPhotoUrl.value = URL.createObjectURL(prepared.blob)
+    if (selection.auto) {
+      openCheckConfirm(selection.auto.point)
+    } else if (selection.candidates.length === 0) {
+      // Nothing on this map to check: offer recording a new poster.
+      checkTarget.value = null
+      checkStep.value = 'confirm'
+    } else {
+      enterCheckMap()
+    }
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : 'Could not run this check')
+  } finally {
+    campaignBusy.value = false
+  }
+}
+
+function openCheckConfirm(point: FieldPoint): void {
+  checkTarget.value = point
+  checkOutcome.value = 'still-there'
+  checkReason.value = null
+  checkNote.value = ''
+  checkStep.value = 'confirm'
+}
+
+function renderCheckMarkers(): void {
+  if (!map) return
+  const draft = checkDraft.value
+  if (!draft) return
+  for (const { point, distanceM } of draft.candidates) {
+    const icon = L.divIcon({
+      className: '',
+      html: `<span class="map-pin" style="--pin-color:${layerFor(point.layerId)?.color ?? '#318b69'}"></span><span class="check-distance-badge">${Math.round(distanceM)} m</span>`,
+      iconSize: [28, 58],
+      iconAnchor: [14, 33],
+    })
+    const marker = L.marker([point.lat, point.lng], {
+      icon,
+      keyboard: true,
+      title: point.title || 'Poster placement',
+    }).addTo(map)
+    marker.on('click', () => selectCheckCandidate(point))
+    checkMarkers.set(point.id, marker)
+  }
+  // "You are here" dot: the GPS fix that was used for the ranking.
+  const position = campaignPosition.value
+  if (position) {
+    const here = L.marker([position.lat, position.lng], {
+      icon: L.divIcon({
+        className: '',
+        html: '<span class="check-here"></span>',
+        iconSize: [14, 14],
+        iconAnchor: [7, 7],
+      }),
+      interactive: false,
+      zIndexOffset: 1000,
+    }).addTo(map)
+    checkMarkers.set('here', here)
+  }
+}
+
+function enterCheckMap(): void {
+  const draft = checkDraft.value
+  if (!draft || !map) return
+  checkStep.value = 'map'
+  renderCheckMarkers()
+  // Frame the matches when there are any, otherwise the nearest candidates.
+  const fit = draft.matches.length > 0 ? draft.matches : draft.candidates.slice(0, 5)
+  const bounds = L.latLngBounds(fit.map((candidate) => L.latLng(candidate.point.lat, candidate.point.lng))).pad(0.5)
+  map.fitBounds(bounds, { maxZoom: 17 })
+}
+
+function selectCheckCandidate(point: FieldPoint): void {
+  if (checkStep.value !== 'map') return
+  openCheckConfirm(point)
+}
+
+function backFromCheckConfirm(): void {
+  const draft = checkDraft.value
+  if (draft && draft.candidates.length > 1) {
+    checkTarget.value = null
+    checkStep.value = 'map'
+  } else {
+    exitCheckToCamera()
+  }
+}
+
+function exitCheckToCamera(): void {
+  checkStep.value = 'camera'
+  checkTarget.value = null
+  checkOutcome.value = null
+  checkReason.value = null
+  checkNote.value = ''
+  discardCheckDraft()
+  renderMarkers()
+}
+
+function discardCheckDraft(): void {
+  checkDraft.value = null
+  if (checkPhotoUrl.value) {
+    URL.revokeObjectURL(checkPhotoUrl.value)
+    checkPhotoUrl.value = ''
+  }
+  checkMarkers.forEach((marker) => marker.remove())
+  checkMarkers.clear()
+}
+
+function finishCheckCapture(): void {
+  campaignCount.value += 1
+  campaignFlash.value = true
+  window.setTimeout(() => {
+    campaignFlash.value = false
+  }, 90)
+  void refreshPointsFromStore()
+  void updateSyncLabel()
+  void runSync()
+}
+
+async function recordCheckOutcome(outcome: 'observed' | 'removed'): Promise<void> {
+  const draft = checkDraft.value
+  const point = checkTarget.value
+  if (!draft || !point || campaignBusy.value) return
+  if (outcome === 'removed' && !checkReason.value) return
+  campaignBusy.value = true
+  try {
+    const occurredAt = new Date().toISOString()
+    const note = checkNote.value.trim() || null
+    const event: PosterEventInput =
+      outcome === 'observed'
+        ? { event_type: 'observed', occurred_at: occurredAt, note }
+        : {
+            event_type: 'removed',
+            occurred_at: occurredAt,
+            removal_reason: checkReason.value,
+            removal_confidence: 'confirmed',
+            note,
+          }
+    const photo: StoredPhoto = {
+      id: crypto.randomUUID(),
+      pointId: point.id,
+      file: draft.prepared.blob,
+      filename: draft.prepared.filename,
+      mimeType: 'image/jpeg',
+      capturedAt: occurredAt,
+      status: 'pending',
+    }
+    await recordPosterEventLocally(point, event, [photo])
+  } catch (error) {
+    campaignBusy.value = false
+    showStatus(error instanceof Error ? error.message : 'Could not save this check')
+    return
+  }
+  campaignBusy.value = false
+  finishCheckCapture()
+  showStatus(
+    navigator.onLine
+      ? 'Check saved on this device · syncing…'
+      : 'Check saved on this device · will sync when online',
+  )
+  exitCheckToCamera()
+}
+
+async function recordCheckAsNew(): Promise<void> {
+  const draft = checkDraft.value
+  if (!draft || !mapId.value || !canEdit.value || campaignBusy.value) return
+  campaignBusy.value = true
+  try {
+    const { point, photo } = buildCampaignPoster({
+      mapId: mapId.value,
+      layerId: activeLayerId.value,
+      lat: draft.position.lat,
+      lng: draft.position.lng,
+      accuracyM: draft.position.accuracyM,
+      capturedAt: new Date().toISOString(),
+      author: currentUserId,
+      file: new File([draft.prepared.blob], draft.prepared.filename),
+    })
+    await createLocalPoint(point, [photo])
+  } catch (error) {
+    campaignBusy.value = false
+    showStatus(error instanceof Error ? error.message : 'Could not record this poster')
+    return
+  }
+  campaignBusy.value = false
+  finishCheckCapture()
+  showStatus(
+    navigator.onLine
+      ? 'Poster saved on this device · syncing…'
+      : 'Poster saved on this device · will sync when online',
+  )
+  exitCheckToCamera()
+}
+
 function onCampaignKeydown(event: KeyboardEvent): void {
-  if (event.key === 'Escape' && campaignMode.value) closeCampaignMode()
+  if (event.key !== 'Escape' || !campaignMode.value) return
+  if (checkStep.value === 'confirm') {
+    backFromCheckConfirm()
+  } else if (checkStep.value === 'map') {
+    exitCheckToCamera()
+  } else {
+    closeCampaignMode()
+  }
 }
 
 async function editPoint(point: FieldPoint): Promise<void> {
@@ -1581,7 +1864,7 @@ onBeforeUnmount(() => {
     <div
       id="map"
       class="map-canvas"
-      :class="{ 'is-placing': placementMode, 'is-campaign': campaignMode }"
+      :class="{ 'is-placing': placementMode, 'is-campaign': campaignMode && checkStep !== 'map' }"
     ></div>
 
     <header class="topbar">
@@ -1894,12 +2177,20 @@ onBeforeUnmount(() => {
     <div
       v-if="campaignMode"
       class="campaign-overlay"
+      :class="{ 'is-map-step': checkStep === 'map' }"
       role="dialog"
       aria-modal="true"
       aria-label="Campaign mode camera"
     >
-      <video ref="campaignVideo" class="campaign-video" autoplay muted playsinline></video>
-      <div class="campaign-topbar">
+      <video
+        ref="campaignVideo"
+        class="campaign-video"
+        :class="{ 'is-hidden': checkStep === 'map' }"
+        autoplay
+        muted
+        playsinline
+      ></video>
+      <div class="campaign-topbar" v-show="checkStep !== 'map'">
         <button class="campaign-close" type="button" aria-label="Close campaign mode" @click="closeCampaignMode">
           ×
         </button>
@@ -1917,18 +2208,199 @@ onBeforeUnmount(() => {
         <p>{{ campaignError }}</p>
         <button type="button" @click="openCampaignCamera">Try camera again</button>
       </div>
-      <div class="campaign-bottom">
-        <span class="campaign-hint" role="status">{{ campaignHint }}</span>
-        <button
-          class="campaign-capture"
-          type="button"
-          aria-label="Capture and save poster"
-          :disabled="campaignBusy"
-          @click="captureCampaignPoster"
-        >
-          <span class="campaign-capture-core"></span>
-        </button>
+      <div v-if="checkStep === 'map' && checkDraft" class="campaign-checkmap">
+        <div class="checkmap-top">
+          <button class="campaign-back" type="button" aria-label="Back to camera" @click="exitCheckToCamera">
+            ←
+          </button>
+          <p class="checkmap-banner" role="status">
+            <template v-if="checkDraft.matches.length">
+              {{ checkDraft.matches.length }} posters within {{ CHECK_MATCH_RADIUS_M }} m — tap one to check it
+            </template>
+            <template v-else>
+              No posters within {{ CHECK_MATCH_RADIUS_M }} m — tap the nearest, or record a new one
+            </template>
+          </p>
+          <button class="campaign-close" type="button" aria-label="Close campaign mode" @click="closeCampaignMode">
+            ×
+          </button>
+        </div>
+        <div class="checkmap-bottom">
+          <button
+            class="checkmap-new"
+            type="button"
+            :disabled="campaignBusy"
+            @click="recordCheckAsNew"
+          >
+            Record new poster here
+          </button>
+        </div>
       </div>
+      <div class="campaign-bottom" v-show="checkStep === 'camera'">
+        <div class="campaign-modes" role="tablist" aria-label="What to record">
+          <button
+            type="button"
+            role="tab"
+            class="campaign-mode-tab"
+            :class="{ active: campaignKind === 'place' }"
+            :aria-selected="campaignKind === 'place'"
+            @click="campaignKind = 'place'"
+          >
+            Place new
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="campaign-mode-tab"
+            :class="{ active: campaignKind === 'check' }"
+            :aria-selected="campaignKind === 'check'"
+            @click="campaignKind = 'check'"
+          >
+            Check existing
+          </button>
+        </div>
+        <div class="campaign-bottom-row">
+          <span class="campaign-hint" role="status">{{ campaignHint }}</span>
+          <button
+            class="campaign-capture"
+            type="button"
+            :aria-label="campaignKind === 'check' ? 'Capture and check poster' : 'Capture and save poster'"
+            :disabled="campaignBusy"
+            @click="campaignKind === 'check' ? captureCampaignCheck() : captureCampaignPoster()"
+          >
+            <span class="campaign-capture-core"></span>
+          </button>
+        </div>
+      </div>
+      <section
+        v-if="checkStep === 'confirm' && checkDraft"
+        class="bottom-sheet check-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="check-sheet-title"
+      >
+        <div class="sheet-grabber" aria-hidden="true"></div>
+        <div class="sheet-header">
+          <div>
+            <p class="eyebrow">CHECK POSTER</p>
+            <h1 id="check-sheet-title">
+              {{ checkTarget ? checkTarget.title || 'Untitled poster' : 'No posters on this map' }}
+            </h1>
+          </div>
+          <button
+            class="sheet-close"
+            type="button"
+            aria-label="Close check"
+            @click="checkTarget ? backFromCheckConfirm() : exitCheckToCamera()"
+          >
+            ×
+          </button>
+        </div>
+        <div class="sheet-content">
+          <template v-if="checkTarget">
+            <div class="check-summary">
+              <img v-if="checkPhotoUrl" :src="checkPhotoUrl" class="check-photo" alt="Captured poster" />
+              <dl class="check-meta">
+                <div v-if="checkTargetDistance !== null">
+                  <dt>Distance</dt>
+                  <dd>≈ {{ checkTargetDistance }} m</dd>
+                </div>
+                <div v-if="checkTarget.lastObservedAt">
+                  <dt>Last observed</dt>
+                  <dd>{{ formatDate(checkTarget.lastObservedAt) }}</dd>
+                </div>
+                <div v-if="checkTarget.campaign">
+                  <dt>Campaign</dt>
+                  <dd>{{ checkTarget.campaign }}</dd>
+                </div>
+              </dl>
+            </div>
+            <div class="check-outcome" role="radiogroup" aria-label="Check outcome">
+              <button
+                type="button"
+                role="radio"
+                class="check-outcome-option"
+                :class="{ active: checkOutcome === 'still-there' }"
+                :aria-checked="checkOutcome === 'still-there'"
+                @click="checkOutcome = 'still-there'"
+              >
+                <strong>Still there</strong>
+                <span>The poster is still up</span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                class="check-outcome-option"
+                :class="{ active: checkOutcome === 'gone' }"
+                :aria-checked="checkOutcome === 'gone'"
+                @click="checkOutcome = 'gone'"
+              >
+                <strong>Gone</strong>
+                <span>The poster has been taken down</span>
+              </button>
+            </div>
+            <template v-if="checkOutcome === 'gone'">
+              <p class="field-label">Why is it gone?</p>
+              <div class="chip-row">
+                <button
+                  v-for="reason in checkReasonOptions"
+                  :key="reason"
+                  type="button"
+                  class="chip"
+                  :class="{ active: checkReason === reason }"
+                  @click="checkReason = reason"
+                >
+                  {{ removalReasonLabel(reason) }}
+                </button>
+              </div>
+              <label class="field-label" for="check-note">Note <span>Optional</span></label>
+              <input
+                id="check-note"
+                v-model="checkNote"
+                class="text-input"
+                maxlength="200"
+                placeholder="e.g. torn down by weather"
+              />
+            </template>
+            <div class="check-actions">
+              <button
+                class="primary-action"
+                type="button"
+                :disabled="campaignBusy || (checkOutcome === 'gone' && !checkReason)"
+                @click="recordCheckOutcome(checkOutcome === 'gone' ? 'removed' : 'observed')"
+              >
+                {{ checkOutcome === 'gone' ? 'Mark as removed' : 'Confirm still there' }}
+              </button>
+              <div class="check-secondary-row">
+                <button
+                  v-if="checkDraft.candidates.length > 1"
+                  type="button"
+                  @click="backFromCheckConfirm"
+                >
+                  Not this poster
+                </button>
+                <button type="button" :disabled="campaignBusy" @click="recordCheckAsNew">
+                  Record as new poster
+                </button>
+              </div>
+            </div>
+          </template>
+          <template v-else>
+            <p class="check-empty">No poster placements are stored on this map yet.</p>
+            <div class="check-actions">
+              <button
+                class="primary-action"
+                type="button"
+                :disabled="campaignBusy"
+                @click="recordCheckAsNew"
+              >
+                Record new poster here
+              </button>
+              <button type="button" @click="exitCheckToCamera">Back to camera</button>
+            </div>
+          </template>
+        </div>
+      </section>
       <div class="campaign-flash" :class="{ on: campaignFlash }"></div>
     </div>
 

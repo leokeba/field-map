@@ -1,3 +1,4 @@
+import { toRaw } from 'vue'
 import {
   ApiError,
   createMap,
@@ -109,6 +110,29 @@ function operation(
     status: 'pending',
     createdAt: Date.now(),
   }
+}
+
+/**
+ * Unwrap Vue reactive proxies — including nested ones — into plain data.
+ * IndexedDB's structuredClone rejects any proxy with a DataCloneError, so
+ * everything written to the offline store must pass through this first.
+ * Points reach these entry points both as full reactive proxies (straight
+ * from a ref) and as plain objects with nested proxy arrays (after
+ * spreading a reactive point), so the unwrap is recursive.
+ */
+function toPlainData<T>(value: T): T {
+  const raw = toRaw(value)
+  if (raw === null || typeof raw !== 'object') return raw as T
+  if (raw instanceof Blob) return raw as T
+  if (Array.isArray(raw)) {
+    return (raw as unknown[]).map((item) => toPlainData(item)) as T
+  }
+  if (Object.getPrototypeOf(raw) !== Object.prototype) return raw as T
+  const plain: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(raw)) {
+    plain[key] = toPlainData(item)
+  }
+  return plain as T
 }
 
 export async function initializeWorkspace(selectedMapId?: string): Promise<Workspace> {
@@ -275,15 +299,17 @@ export async function createLocalPoint(
   point: FieldPoint,
   photos: StoredPhoto[],
 ): Promise<void> {
-  const queued = operation(point.mapId, point.id, 'create', null)
+  const source = toPlainData(point)
+  const plainPhotos = toPlainData(photos)
+  const queued = operation(source.mapId, source.id, 'create', null)
   await offlineDb.transaction(
     'rw',
     offlineDb.points,
     offlineDb.photos,
     offlineDb.operations,
     async () => {
-      await offlineDb.points.put({ ...point, version: null, syncStatus: 'pending' })
-      if (photos.length) await offlineDb.photos.bulkPut(photos)
+      await offlineDb.points.put({ ...source, version: null, syncStatus: 'pending' })
+      if (plainPhotos.length) await offlineDb.photos.bulkPut(plainPhotos)
       await offlineDb.operations.put(queued)
     },
   )
@@ -295,19 +321,21 @@ export async function updateLocalPoint(
   removedPhotoIds: string[],
   posterEvent?: PosterEventInput,
 ): Promise<void> {
+  const source = toPlainData(point)
+  const plainPhotos = toPlainData(addedPhotos)
   await offlineDb.transaction(
     'rw',
     offlineDb.points,
     offlineDb.photos,
     offlineDb.operations,
     async () => {
-      await offlineDb.points.put(point)
-      if (addedPhotos.length) await offlineDb.photos.bulkPut(addedPhotos)
+      await offlineDb.points.put(source)
+      if (plainPhotos.length) await offlineDb.photos.bulkPut(plainPhotos)
       for (const photoId of removedPhotoIds) {
         const photo = await offlineDb.photos.get(photoId)
         if (photo?.remoteId) {
           await offlineDb.operations.put(
-            operation(point.mapId, point.id, 'delete-photo', point.version, photo.remoteId),
+            operation(source.mapId, source.id, 'delete-photo', source.version, photo.remoteId),
           )
         }
         await offlineDb.photos.delete(photoId)
@@ -315,7 +343,7 @@ export async function updateLocalPoint(
 
       const queued = await offlineDb.operations
         .where('pointId')
-        .equals(point.id)
+        .equals(source.id)
         .toArray()
       const create = queued.find((item) => item.type === 'create' && item.status === 'pending')
       if (create && posterEvent) {
@@ -323,12 +351,12 @@ export async function updateLocalPoint(
           ...create,
           posterEvents: [...(create.posterEvents ?? []), posterEvent],
         })
-      } else if (!create && point.version !== null) {
+      } else if (!create && source.version !== null) {
         const update = queued.find((item) => item.type === 'update' && item.status === 'pending')
         if (update) {
           await offlineDb.operations.put({
             ...update,
-            expectedVersion: update.expectedVersion ?? point.version,
+            expectedVersion: update.expectedVersion ?? source.version,
             posterEvents: posterEvent
               ? [...(update.posterEvents ?? []), posterEvent]
               : update.posterEvents,
@@ -336,10 +364,10 @@ export async function updateLocalPoint(
         } else {
           await offlineDb.operations.put(
             operation(
-              point.mapId,
-              point.id,
+              source.mapId,
+              source.id,
               'update',
-              point.version,
+              source.version,
               undefined,
               posterEvent ? [posterEvent] : undefined,
             ),
@@ -350,35 +378,54 @@ export async function updateLocalPoint(
   )
 }
 
+/**
+ * Apply a poster lifecycle event to a cached point and queue it for sync.
+ * Optional photos (e.g. the camera capture from a campaign check) are stored
+ * alongside so the sync pipeline uploads them after the event operation lands.
+ */
 export async function recordPosterEventLocally(
   point: FieldPoint,
   event: PosterEventInput,
+  photos: StoredPhoto[] = [],
 ): Promise<FieldPoint> {
   if (point.recordType !== 'poster' || point.status !== 'active') {
     throw new Error('Only active poster placements can receive lifecycle events')
   }
+  // Unwrap before spreading: a reactive proxy (or a plain object holding
+  // nested proxy arrays) would leak proxies into `updated`, which
+  // IndexedDB cannot clone (DataCloneError).
+  const source = toPlainData(point)
   const updated: FieldPoint = {
-    ...point,
+    ...source,
     status: event.event_type === 'removed' ? 'removed' : 'active',
     lastObservedAt:
-      event.event_type === 'observed' ? event.occurred_at : point.lastObservedAt,
-    removedAt: event.event_type === 'removed' ? event.occurred_at : point.removedAt,
+      event.event_type === 'observed' ? event.occurred_at : source.lastObservedAt,
+    removedAt: event.event_type === 'removed' ? event.occurred_at : source.removedAt,
     removalReason:
-      event.event_type === 'removed' ? event.removal_reason ?? 'unknown' : point.removalReason,
+      event.event_type === 'removed' ? event.removal_reason ?? 'unknown' : source.removalReason,
     removalConfidence:
       event.event_type === 'removed'
         ? event.removal_confidence ?? 'unknown'
-        : point.removalConfidence,
-    removalNote: event.event_type === 'removed' ? event.note ?? '' : point.removalNote,
+        : source.removalConfidence,
+    removalNote: event.event_type === 'removed' ? event.note ?? '' : source.removalNote,
+    photos: [
+      ...(source.photos ?? []),
+      ...photos.map((stored) => ({
+        id: stored.id,
+        filename: stored.filename,
+        status: 'pending' as const,
+        capturedAt: stored.capturedAt,
+      })),
+    ],
     events: [
-      ...(point.events ?? []),
+      ...(source.events ?? []),
       {
         id: crypto.randomUUID(),
-        point_id: point.id,
+        point_id: source.id,
         event_type: event.event_type,
         occurred_at: event.occurred_at,
         recorded_at: new Date().toISOString(),
-        actor_id: point.author,
+        actor_id: source.author,
         removal_reason: event.removal_reason ?? null,
         removal_confidence: event.removal_confidence ?? null,
         note: event.note ?? null,
@@ -386,28 +433,29 @@ export async function recordPosterEventLocally(
     ],
     syncStatus: 'pending',
   }
-  await updateLocalPoint(updated, [], [], event)
+  await updateLocalPoint(updated, photos, [], event)
   return updated
 }
 
 export async function deleteLocalPoint(point: FieldPoint): Promise<void> {
+  const source = toPlainData(point)
   await offlineDb.transaction(
     'rw',
     offlineDb.points,
     offlineDb.photos,
     offlineDb.operations,
     async () => {
-      const queued = await offlineDb.operations.where('pointId').equals(point.id).toArray()
-      if (point.version === null || queued.some((item) => item.type === 'create')) {
-        await offlineDb.points.delete(point.id)
-        await offlineDb.photos.where('pointId').equals(point.id).delete()
-        await offlineDb.operations.where('pointId').equals(point.id).delete()
+      const queued = await offlineDb.operations.where('pointId').equals(source.id).toArray()
+      if (source.version === null || queued.some((item) => item.type === 'create')) {
+        await offlineDb.points.delete(source.id)
+        await offlineDb.photos.where('pointId').equals(source.id).delete()
+        await offlineDb.operations.where('pointId').equals(source.id).delete()
         return
       }
-      await offlineDb.points.put({ ...point, syncStatus: 'delete-pending' })
-      await offlineDb.operations.where('pointId').equals(point.id).delete()
+      await offlineDb.points.put({ ...source, syncStatus: 'delete-pending' })
+      await offlineDb.operations.where('pointId').equals(source.id).delete()
       await offlineDb.operations.put(
-        operation(point.mapId, point.id, 'delete', point.version),
+        operation(source.mapId, source.id, 'delete', source.version),
       )
     },
   )

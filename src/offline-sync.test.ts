@@ -1,4 +1,5 @@
 import 'fake-indexeddb/auto'
+import { reactive } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { getLayers } from './api'
 import { offlineDb } from './offline-db'
@@ -129,6 +130,165 @@ describe('offline point queue', () => {
         posterEvents: [{ event_type: 'removed', removal_reason: 'suspected_opposition' }],
       },
     ])
+  })
+
+  it('queues a check event and its camera photo in one offline operation', async () => {
+    const point = makePoint({ version: 2, syncStatus: 'synced' })
+    await offlineDb.points.put(point)
+    const photo: StoredPhoto = {
+      id: 'photo-check-1',
+      pointId: point.id,
+      file: new Blob(['camera frame'], { type: 'image/jpeg' }),
+      filename: 'poster-check.jpg',
+      mimeType: 'image/jpeg',
+      capturedAt: '2026-11-14T09:00:00.000Z',
+      status: 'pending',
+    }
+
+    const updated = await recordPosterEventLocally(
+      point,
+      {
+        event_type: 'observed',
+        occurred_at: '2026-11-14T09:00:00.000Z',
+        note: 'Still up during campaign check.',
+      },
+      [photo],
+    )
+
+    expect(updated.status).toBe('active')
+    expect(updated.lastObservedAt).toBe('2026-11-14T09:00:00.000Z')
+    expect(updated.events).toHaveLength(1)
+    expect(await offlineDb.photos.get(photo.id)).toMatchObject({
+      pointId: point.id,
+      status: 'pending',
+    })
+    const operations = await offlineDb.operations.where('pointId').equals(point.id).toArray()
+    expect(operations).toHaveLength(1)
+    expect(operations[0]).toMatchObject({
+      type: 'update',
+      expectedVersion: 2,
+      posterEvents: [{ event_type: 'observed' }],
+    })
+  })
+
+  it('records a check event from a reactive point without a DataCloneError', async () => {
+    // The campaign check flow hands over `checkTarget.value`, a deeply
+    // reactive proxy of a cached point. IndexedDB cannot clone proxies, so
+    // the store must unwrap before writing. The fixture mirrors a real
+    // cached poster: an existing photo reference, a placed event, and a
+    // serverShadow — the nested objects that leak as proxies when the
+    // point is spread.
+    const point = reactive(
+      makePoint({
+        version: 2,
+        syncStatus: 'synced',
+        photos: [
+          {
+            id: 'photo-1',
+            filename: 'original.jpg',
+            status: 'synced',
+            capturedAt: '2026-11-13T10:00:00.000Z',
+          },
+        ],
+        events: [
+          {
+            id: 'event-1',
+            point_id: 'point-1',
+            event_type: 'placed',
+            occurred_at: '2026-11-13T10:00:00.000Z',
+            recorded_at: '2026-11-13T10:00:00.000Z',
+            actor_id: 'local-user',
+            removal_reason: null,
+            removal_confidence: null,
+            note: null,
+          },
+        ],
+        serverShadow: {
+          id: 'point-1',
+          map_id: 'map-1',
+          layer_id: 'layer-1',
+          lat: 51.5,
+          lng: -0.12,
+          title: 'Field note',
+          description: '',
+          record_type: 'poster',
+          campaign: '',
+          quantity: 1,
+          status: 'active',
+          last_observed_at: '2026-11-13T10:00:00.000Z',
+          removed_at: null,
+          removal_reason: null,
+          removal_confidence: null,
+          removal_note: '',
+          created_by: 'local-user',
+          captured_at: '2026-11-13T10:00:00.000Z',
+          created_at: '2026-11-13T10:00:00.000Z',
+          updated_at: '2026-11-13T10:00:00.000Z',
+          client_created_at: null,
+          location_accuracy_m: null,
+          version: 2,
+          photos: [],
+        },
+      }),
+    )
+    const photo: StoredPhoto = {
+      id: 'photo-check-2',
+      pointId: point.id,
+      file: new Blob(['camera frame'], { type: 'image/jpeg' }),
+      filename: 'poster-check.jpg',
+      mimeType: 'image/jpeg',
+      capturedAt: '2026-11-14T09:00:00.000Z',
+      status: 'pending',
+    }
+
+    const updated = await recordPosterEventLocally(
+      point,
+      { event_type: 'observed', occurred_at: '2026-11-14T09:00:00.000Z' },
+      [photo],
+    )
+
+    expect(updated.lastObservedAt).toBe('2026-11-14T09:00:00.000Z')
+    expect(updated.photos).toEqual([
+      {
+        id: 'photo-1',
+        filename: 'original.jpg',
+        status: 'synced',
+        capturedAt: '2026-11-13T10:00:00.000Z',
+      },
+      {
+        id: photo.id,
+        filename: photo.filename,
+        status: 'pending',
+        capturedAt: photo.capturedAt,
+      },
+    ])
+    expect(updated.events).toHaveLength(2)
+    expect(updated.events?.[1]).toMatchObject({
+      event_type: 'observed',
+      occurred_at: '2026-11-14T09:00:00.000Z',
+    })
+    const stored = await offlineDb.points.get(point.id)
+    expect(stored?.syncStatus).toBe('pending')
+    expect(stored?.photos).toEqual(updated.photos)
+    expect(stored?.events).toHaveLength(2)
+    expect(await offlineDb.photos.get(photo.id)).toMatchObject({ status: 'pending' })
+  })
+
+  it('updates a plain point that still holds nested reactive arrays', async () => {
+    // The point editor spreads a reactive point from `points.value` into a
+    // fresh object: plain at the top level, but `events` and `photos` are
+    // still reactive proxies. The boundary must unwrap those too.
+    const reactivePoint = reactive(makePoint({ version: 3, syncStatus: 'synced' }))
+    const edited: FieldPoint = { ...reactivePoint, title: 'Edited title', syncStatus: 'pending' }
+
+    await updateLocalPoint(edited, [], [])
+
+    const stored = await offlineDb.points.get(edited.id)
+    expect(stored?.title).toBe('Edited title')
+    expect(stored?.syncStatus).toBe('pending')
+    const operations = await offlineDb.operations.where('pointId').equals(edited.id).toArray()
+    expect(operations).toHaveLength(1)
+    expect(operations[0].type).toBe('update')
   })
 
   it('queues follow-up observations and updates the latest observation time', async () => {

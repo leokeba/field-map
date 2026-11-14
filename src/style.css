@@ -996,11 +996,17 @@ button {
   bottom: 0;
   left: 0;
   display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 16px calc(18px + env(safe-area-inset-bottom));
+  background: linear-gradient(#10150f00, #10150fd9);
+}
+
+.campaign-bottom-row {
+  display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px 16px calc(18px + env(safe-area-inset-bottom));
-  background: linear-gradient(#10150f00, #10150fd9);
 }
 
 .campaign-hint {
@@ -1057,6 +1063,306 @@ button {
 
 .campaign-flash.on {
   opacity: 0.9;
+}
+
+/* Check-mode disambiguation: the camera hands the screen to the map below,
+   and only the check chrome keeps pointer events. */
+.campaign-overlay.is-map-step {
+  background: transparent;
+  pointer-events: none;
+}
+
+.campaign-overlay.is-map-step .campaign-checkmap {
+  pointer-events: none;
+}
+
+.campaign-overlay.is-map-step .checkmap-top,
+.campaign-overlay.is-map-step .checkmap-bottom {
+  pointer-events: auto;
+}
+
+.campaign-video.is-hidden {
+  display: none;
+}
+
+/* Mode selector sits above the shutter, camera-app style. */
+.campaign-modes {
+  align-self: center;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: #242c2799;
+  border-radius: 999px;
+}
+
+.campaign-mode-tab {
+  padding: 9px 16px;
+  color: #ffffffb3;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.campaign-mode-tab.active {
+  color: #10150f;
+  background: #fff;
+}
+
+.campaign-checkmap {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+}
+
+.checkmap-top {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: calc(14px + env(safe-area-inset-top)) 16px 12px;
+  background: linear-gradient(#10150fd9, #10150f00);
+}
+
+.checkmap-banner {
+  flex: 1;
+  margin: 0;
+  min-width: 0;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.campaign-back {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  color: #fff;
+  background: #242c2799;
+  border: 0;
+  border-radius: 50%;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.checkmap-bottom {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  justify-content: center;
+  padding: 16px 16px calc(20px + env(safe-area-inset-bottom));
+  background: linear-gradient(#10150f00, #10150fd9);
+}
+
+.checkmap-new {
+  min-height: 48px;
+  padding: 0 22px;
+  color: #10150f;
+  background: #fff;
+  border: 0;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 16px #10150f4d;
+}
+
+.checkmap-new:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.check-distance-badge {
+  display: block;
+  margin-top: 4px;
+  padding: 2px 6px;
+  color: #fff;
+  background: #242923d9;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.check-here {
+  display: block;
+  width: 14px;
+  height: 14px;
+  background: #3b82f6;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 7px #3b82f62e;
+}
+
+.check-summary {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.check-photo {
+  width: 84px;
+  height: 84px;
+  object-fit: cover;
+  border-radius: 12px;
+  background: #e8e9e3;
+}
+
+.check-meta {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.check-meta > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.check-meta dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.check-meta dd {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.check-outcome {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.check-outcome-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-height: 64px;
+  padding: 11px 13px;
+  text-align: left;
+  color: var(--ink);
+  background: #f4f5f0;
+  border: 2px solid transparent;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
+.check-outcome-option strong {
+  font-size: 14px;
+}
+
+.check-outcome-option span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.check-outcome-option.active {
+  background: #27735414;
+  border-color: var(--green);
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.chip {
+  padding: 8px 14px;
+  color: var(--ink);
+  background: #f4f5f0;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chip.active {
+  background: #27735414;
+  border-color: var(--green);
+}
+
+.check-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.primary-action {
+  display: flex;
+  width: 100%;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  background: var(--green);
+  border: 0;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.primary-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.check-secondary-row {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+.check-secondary-row button {
+  min-height: 40px;
+  padding: 0 16px;
+  color: var(--green);
+  background: transparent;
+  border: 1.5px solid #27735459;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.check-secondary-row button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+.check-empty {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .bottom-sheet {

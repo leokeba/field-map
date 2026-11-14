@@ -72,3 +72,72 @@ export function buildCampaignPoster(capture: CampaignCapture): CampaignPoster {
   }
   return { point, photo }
 }
+
+/** Base radius for "which poster am I looking at?" in campaign check mode. */
+export const CHECK_MATCH_RADIUS_M = 25
+
+export interface CheckPosition {
+  lat: number
+  lng: number
+  accuracyM: number | null
+}
+
+export interface CheckCandidate {
+  point: FieldPoint
+  distanceM: number
+}
+
+export interface CheckSelection {
+  /** Every active poster sorted by distance, for the disambiguation list. */
+  candidates: CheckCandidate[]
+  /** Posters inside the match radius (GPS accuracy added on top). */
+  matches: CheckCandidate[]
+  /** The single auto-selected match, or null when a human should choose. */
+  auto: CheckCandidate | null
+}
+
+/** Great-circle distance in metres (haversine). */
+export function haversineM(
+  latA: number,
+  lngA: number,
+  latB: number,
+  lngB: number,
+): number {
+  const toRad = (value: number) => (value * Math.PI) / 180
+  const earthRadiusM = 6371008.8
+  const dLat = toRad(latB - latA)
+  const dLng = toRad(lngB - lngA)
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(latA)) * Math.cos(toRad(latB)) * Math.sin(dLng / 2) ** 2
+  return 2 * earthRadiusM * Math.asin(Math.min(1, Math.sqrt(a)))
+}
+
+/**
+ * Rank nearby poster points for a campaign "check". Only active posters are
+ * candidates (observations have no lifecycle, removed posters are closed).
+ * GPS accuracy is added to the match radius so a coarse fix does not
+ * silently miss the poster a few metres away; anything ambiguous is left
+ * for the map disambiguation step.
+ */
+export function rankCheckCandidates(
+  points: FieldPoint[],
+  position: CheckPosition,
+  radiusM: number = CHECK_MATCH_RADIUS_M,
+): CheckSelection {
+  const candidates: CheckCandidate[] = points
+    .filter(
+      (point) =>
+        point.recordType === 'poster' &&
+        point.status === 'active' &&
+        point.syncStatus !== 'delete-pending',
+    )
+    .map((point) => ({
+      point,
+      distanceM: haversineM(position.lat, position.lng, point.lat, point.lng),
+    }))
+    .sort((first, second) => first.distanceM - second.distanceM)
+  const effectiveRadiusM = radiusM + (position.accuracyM ?? 0)
+  const matches = candidates.filter((candidate) => candidate.distanceM <= effectiveRadiusM)
+  return { candidates, matches, auto: matches.length === 1 ? matches[0] : null }
+}

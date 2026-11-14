@@ -1,6 +1,12 @@
 import 'fake-indexeddb/auto'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { buildCampaignPoster, type CampaignCapture } from './campaign'
+import {
+  buildCampaignPoster,
+  CHECK_MATCH_RADIUS_M,
+  haversineM,
+  rankCheckCandidates,
+  type CampaignCapture,
+} from './campaign'
 import { offlineDb } from './offline-db'
 import { createLocalPoint, updateLocalPoint } from './offline-sync'
 import type { FieldPoint, StoredPhoto } from './types'
@@ -133,5 +139,111 @@ describe('campaign poster offline queue', () => {
     // IndexedDB round-trips a File as a Blob; assert on the content, not identity.
     expect(stored?.file).toBeInstanceOf(Blob)
     expect(stored?.file).toMatchObject({ size: capture.file.size, type: capture.file.type })
+  })
+})
+
+describe('rankCheckCandidates', () => {
+  let pointCounter = 0
+
+  // A point `offsetM` metres north of the check position (1 degree of
+  // latitude ≈ 111320 m, close enough for threshold tests).
+  function makePointAt(offsetM: number, overrides: Partial<FieldPoint> = {}): FieldPoint {
+    pointCounter += 1
+    return {
+      id: `point-${pointCounter}`,
+      mapId: 'map-1',
+      layerId: 'layer-1',
+      lat: 51.5072 + offsetM / 111320,
+      lng: -0.1276,
+      title: `Poster ${pointCounter}`,
+      description: '',
+      recordType: 'poster',
+      campaign: '',
+      quantity: 1,
+      status: 'active',
+      lastObservedAt: null,
+      removedAt: null,
+      removalReason: null,
+      removalConfidence: null,
+      removalNote: '',
+      events: [],
+      capturedAt: '2026-11-14T09:00:00.000Z',
+      clientCreatedAt: '2026-11-14T09:00:00.000Z',
+      accuracyM: 8,
+      author: 'local-user',
+      version: 1,
+      syncStatus: 'synced',
+      photos: [],
+      ...overrides,
+    }
+  }
+
+  const position = { lat: 51.5072, lng: -0.1276, accuracyM: 0 }
+
+  it('measures great-circle distances in metres', () => {
+    expect(haversineM(51.5072, -0.1276, 51.5072 + 100 / 111320, -0.1276)).toBeGreaterThan(98)
+    expect(haversineM(51.5072, -0.1276, 51.5072 + 100 / 111320, -0.1276)).toBeLessThan(102)
+    expect(haversineM(51.5072, -0.1276, 51.5072, -0.1276)).toBe(0)
+  })
+
+  it('auto-selects the single active poster inside the match radius', () => {
+    const near = makePointAt(15)
+    const far = makePointAt(120)
+
+    const selection = rankCheckCandidates([far, near], position)
+
+    expect(selection.auto?.point.id).toBe(near.id)
+    expect(selection.matches).toHaveLength(1)
+    expect(selection.candidates.map((candidate) => candidate.point.id)).toEqual([near.id, far.id])
+  })
+
+  it('leaves the choice to the map when two posters are inside the match radius', () => {
+    const first = makePointAt(10)
+    const second = makePointAt(20)
+
+    const selection = rankCheckCandidates([first, second], position)
+
+    expect(selection.auto).toBeNull()
+    expect(selection.matches.map((candidate) => candidate.point.id)).toEqual([first.id, second.id])
+  })
+
+  it('reports no matches when the nearest poster is outside the radius', () => {
+    const selection = rankCheckCandidates([makePointAt(80)], position)
+
+    expect(selection.auto).toBeNull()
+    expect(selection.matches).toEqual([])
+    expect(selection.candidates).toHaveLength(1)
+  })
+
+  it('adds the GPS accuracy to the match radius', () => {
+    const loosePosition = { lat: 51.5072, lng: -0.1276, accuracyM: 20 }
+    const wobbly = makePointAt(30)
+
+    expect(rankCheckCandidates([wobbly], loosePosition).matches).toHaveLength(1)
+    expect(rankCheckCandidates([wobbly], position).matches).toEqual([])
+  })
+
+  it('ignores observations, removed posters, and delete-pending points', () => {
+    const excluded = [
+      makePointAt(5, { recordType: 'observation' }),
+      makePointAt(5, { status: 'removed' }),
+      makePointAt(5, { syncStatus: 'delete-pending' }),
+    ]
+
+    const selection = rankCheckCandidates(excluded, position)
+
+    expect(selection.candidates).toEqual([])
+    expect(selection.auto).toBeNull()
+  })
+
+  it('treats a null GPS accuracy as zero extra radius', () => {
+    const noAccuracy = { lat: 51.5072, lng: -0.1276, accuracyM: null }
+    const outside = makePointAt(40)
+
+    const selection = rankCheckCandidates([outside], noAccuracy)
+
+    expect(selection.matches).toEqual([])
+    expect(selection.auto).toBeNull()
+    expect(selection.candidates[0].distanceM).toBeGreaterThan(CHECK_MATCH_RADIUS_M)
   })
 })
