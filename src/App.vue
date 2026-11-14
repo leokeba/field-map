@@ -1165,6 +1165,10 @@ async function captureCampaignPoster(): Promise<void> {
 // none match close enough) → record 'observed' / 'removed' with the photo.
 // ---------------------------------------------------------------------------
 
+// While the disambiguation map is showing, the main app chrome (topbar,
+// floating action buttons) would float over the map, so it is hidden.
+const checkMapStep = computed(() => campaignMode.value && checkStep.value === 'map')
+
 const checkTargetDistance = computed(() => {
   const draft = checkDraft.value
   const target = checkTarget.value
@@ -1262,10 +1266,19 @@ function enterCheckMap(): void {
   if (!draft || !map) return
   checkStep.value = 'map'
   renderCheckMarkers()
-  // Frame the matches when there are any, otherwise the nearest candidates.
-  const fit = draft.matches.length > 0 ? draft.matches : draft.candidates.slice(0, 5)
-  const bounds = L.latLngBounds(fit.map((candidate) => L.latLng(candidate.point.lat, candidate.point.lng))).pad(0.5)
-  map.fitBounds(bounds, { maxZoom: 17 })
+  // The container may still be measured against a stale layout viewport
+  // (iOS resizes the dynamic viewport after the map was initialized), so
+  // force a re-measure before framing the candidates.
+  void nextTick().then(() => {
+    window.requestAnimationFrame(() => {
+      if (!map) return
+      map.invalidateSize()
+      // Frame the matches when there are any, otherwise the nearest candidates.
+      const fit = draft.matches.length > 0 ? draft.matches : draft.candidates.slice(0, 5)
+      const bounds = L.latLngBounds(fit.map((candidate) => L.latLng(candidate.point.lat, candidate.point.lng))).pad(0.5)
+      map.fitBounds(bounds, { maxZoom: 17 })
+    })
+  })
 }
 
 function selectCheckCandidate(point: FieldPoint): void {
@@ -1864,10 +1877,10 @@ onBeforeUnmount(() => {
     <div
       id="map"
       class="map-canvas"
-      :class="{ 'is-placing': placementMode, 'is-campaign': campaignMode && checkStep !== 'map' }"
+      :class="{ 'is-placing': placementMode, 'is-campaign': campaignMode }"
     ></div>
 
-    <header class="topbar">
+    <header class="topbar" v-show="!checkMapStep">
       <button class="brand map-manager-trigger" type="button" aria-label="Manage maps" @click="openMapManager">
         <span class="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none">
@@ -2139,7 +2152,7 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
-    <div class="map-actions">
+    <div class="map-actions" v-show="!checkMapStep">
       <button
         class="icon-button location-button"
         type="button"
