@@ -6,6 +6,17 @@
     <meta name="theme-color" content="#f6f5f0" />
     <meta name="description" content="A simple map for collecting field observations." />
     <title>Field Map</title>
+    <!-- Fonts load non-blocking via <link>, never as a CSS @import: a pending
+         @import blocks the whole app stylesheet, which used to race Leaflet's
+         init on slow networks and leave the map container mis-sized. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      media="print"
+      onload="this.media = 'all'"
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap"
+    />
   </head>
   <body>
     <div id="app"></div>
