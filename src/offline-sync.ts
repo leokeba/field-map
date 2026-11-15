@@ -20,7 +20,7 @@ import {
   uploadPhoto,
 } from './api'
 import { offlineDb } from './offline-db'
-import { blobToBase64, photoBlob } from './photo-bytes'
+import { blobToBase64, looksLikeBase64, photoBlob } from './photo-bytes'
 import type {
   ApiChange,
   ApiPoint,
@@ -136,7 +136,40 @@ function toPlainData<T>(value: T): T {
   return plain as T
 }
 
+/**
+ * Self-heal the photos table on start: encode any pre-migration rows whose
+ * Blob is still readable, and drop rows whose bytes are gone. iOS Safari's
+ * Blob-store bug (webkit#188438) can leave records with a corrupt or missing
+ * payload; without this they would throw from atob() on every render. The
+ * table only holds cached photos, so a full scan is cheap.
+ */
+export async function healPhotoStore(): Promise<void> {
+  await offlineDb.transaction('rw', offlineDb.photos, async () => {
+    const rows = await offlineDb.photos.toArray()
+    for (const row of rows) {
+      if (typeof row.fileData === 'string' && looksLikeBase64(row.fileData)) continue
+      const legacyFile = (row as StoredPhoto & { file?: unknown }).file
+      if (legacyFile instanceof Blob) {
+        await offlineDb.photos.put({
+          id: row.id,
+          pointId: row.pointId,
+          fileData: await blobToBase64(legacyFile),
+          filename: row.filename,
+          mimeType: row.mimeType,
+          capturedAt: row.capturedAt,
+          status: row.status,
+          remoteId: row.remoteId,
+        })
+        continue
+      }
+      console.warn('Dropping photo record without usable bytes', row.id)
+      await offlineDb.photos.delete(row.id)
+    }
+  })
+}
+
 export async function initializeWorkspace(selectedMapId?: string): Promise<Workspace> {
+  await healPhotoStore()
   const cachedMaps = await offlineDb.maps.orderBy('updated_at').reverse().toArray()
   let map = selectedMapId
     ? cachedMaps.find((cachedMap) => cachedMap.id === selectedMapId)
@@ -598,11 +631,18 @@ async function processPhotos(mapId: string): Promise<void> {
     const photos = await offlineDb.photos.where('pointId').equals(point.id).toArray()
     for (const photo of photos) {
       if (photo.status !== 'pending') continue
+      const blob = photoBlob(photo)
+      if (!blob) {
+        // Bytes were lost to the iOS Blob-store bug: drop the row so sync
+        // moves on instead of failing this photo forever.
+        await offlineDb.photos.delete(photo.id)
+        continue
+      }
       await offlineDb.photos.put({ ...photo, status: 'uploading' })
       try {
         const result = await uploadPhoto(
           point.id,
-          photoBlob(photo),
+          blob,
           photo.filename,
           photo.capturedAt,
           point.version,

@@ -3,11 +3,13 @@ import { reactive } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { getLayers } from './api'
 import { offlineDb } from './offline-db'
+import { photoBlob } from './photo-bytes'
 import {
   createLocalPoint,
   deleteCachedLayerData,
   deleteCachedWorkspace,
   deleteLocalPoint,
+  healPhotoStore,
   initializeWorkspace,
   recordPosterEventLocally,
   updateLocalPoint,
@@ -519,5 +521,83 @@ describe('offline point queue', () => {
 
     expect(workspace.layers).toEqual([serverLayer])
     expect(await offlineDb.layers.where('map_id').equals(map.id).toArray()).toEqual([serverLayer])
+  })
+})
+
+describe('photo store self-heal', () => {
+  beforeEach(async () => {
+    vi.unstubAllGlobals()
+    await offlineDb.delete()
+    await offlineDb.open()
+  })
+
+  it('encodes a legacy row whose Blob is still readable and drops the Blob', async () => {
+    const legacy = {
+      id: 'photo-legacy',
+      pointId: 'point-1',
+      file: new Blob(['image bytes'], { type: 'image/jpeg' }),
+      filename: 'legacy.jpg',
+      mimeType: 'image/jpeg',
+      capturedAt: null,
+      status: 'pending',
+    } as StoredPhoto & { file: Blob }
+    await offlineDb.photos.put(legacy)
+
+    await healPhotoStore()
+
+    const healed = (await offlineDb.photos.get('photo-legacy')) as StoredPhoto & { file?: unknown }
+    expect(healed.fileData).toBe(IMAGE_BYTES_B64)
+    expect(healed.file).toBeUndefined()
+  })
+
+  it('drops a row whose bytes are gone and leaves healthy rows untouched', async () => {
+    const broken = {
+      id: 'photo-broken',
+      pointId: 'point-1',
+      filename: 'broken.jpg',
+      mimeType: 'image/jpeg',
+      capturedAt: null,
+      status: 'pending',
+    } as StoredPhoto
+    const healthy: StoredPhoto = {
+      id: 'photo-healthy',
+      pointId: 'point-1',
+      fileData: CAMERA_FRAME_B64,
+      filename: 'healthy.jpg',
+      mimeType: 'image/jpeg',
+      capturedAt: null,
+      status: 'synced',
+    }
+    await offlineDb.photos.bulkPut([broken, healthy])
+
+    await healPhotoStore()
+
+    expect(await offlineDb.photos.get('photo-broken')).toBeUndefined()
+    expect(await offlineDb.photos.get('photo-healthy')).toMatchObject({ fileData: CAMERA_FRAME_B64 })
+  })
+
+  it('rehydrates a base64 payload and falls back to legacy Blobs, else null', async () => {
+    const stored: StoredPhoto = {
+      id: 'photo-1',
+      pointId: 'point-1',
+      fileData: IMAGE_BYTES_B64,
+      filename: 'field.jpg',
+      mimeType: 'image/jpeg',
+      capturedAt: null,
+      status: 'pending',
+    }
+    const blob = photoBlob(stored)
+    expect(blob).toBeInstanceOf(Blob)
+    if (blob) {
+      expect(await blob.text()).toBe('image bytes')
+      expect(blob.type).toBe('image/jpeg')
+    }
+
+    const legacyFile = new Blob(['camera frame'], { type: 'image/jpeg' })
+    const legacy = { ...stored, id: 'photo-2', fileData: undefined, file: legacyFile } as unknown as StoredPhoto & { file?: unknown }
+    expect(photoBlob(legacy)).toBe(legacyFile)
+
+    const empty = { ...stored, id: 'photo-3', fileData: undefined } as unknown as StoredPhoto & { file?: unknown }
+    expect(photoBlob(empty)).toBeNull()
   })
 })

@@ -25,7 +25,26 @@ export function base64ToBlob(data: string, type: string): Blob {
   return new Blob([bytes], { type })
 }
 
-/** Rehydrate a stored photo's base64 payload into an uploadable Blob. */
-export function photoBlob(photo: StoredPhoto): Blob {
-  return base64ToBlob(photo.fileData, photo.mimeType)
+/** Structural check for btoa() output; atob() accepts exactly this shape. */
+export function looksLikeBase64(value: string): boolean {
+  return value.length > 0 && value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value)
+}
+
+/**
+ * Rehydrate a stored photo's base64 payload into an uploadable Blob.
+ * Returns null when the row carries no usable bytes: iOS Safari's Blob-store
+ * bug (webkit#188438) can leave records with a corrupt or missing payload,
+ * and callers must skip those instead of throwing from atob().
+ */
+export function photoBlob(photo: StoredPhoto & { file?: unknown }): Blob | null {
+  if (typeof photo.fileData === 'string' && looksLikeBase64(photo.fileData)) {
+    try {
+      return base64ToBlob(photo.fileData, photo.mimeType)
+    } catch {
+      return null
+    }
+  }
+  // Legacy rows written before the base64 migration.
+  if (photo.file instanceof Blob) return photo.file
+  return null
 }

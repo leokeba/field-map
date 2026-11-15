@@ -319,7 +319,8 @@ async function refreshPhotoUrls(): Promise<void> {
   for (const photo of photos) {
     if (photoUrls.value[photo.id]) continue
     const stored = await offlineDb.photos.get(photo.id)
-    if (stored) photoUrls.value[photo.id] = URL.createObjectURL(photoBlob(stored))
+    const blob = stored ? photoBlob(stored) : null
+    if (blob) photoUrls.value[photo.id] = URL.createObjectURL(blob)
   }
 }
 
@@ -1423,7 +1424,7 @@ async function editPoint(point: FieldPoint): Promise<void> {
       const stored = await offlineDb.photos.get(photo.id)
       return {
         ...photo,
-        file: stored ? photoBlob(stored) : undefined,
+        file: stored ? photoBlob(stored) ?? undefined : undefined,
         mimeType: stored?.mimeType,
         remoteId: stored?.remoteId,
         isNew: false,
