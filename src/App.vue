@@ -5,6 +5,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   buildCampaignPoster,
   CHECK_MATCH_RADIUS_M,
+  groupCheckSpots,
   rankCheckCandidates,
   type CheckCandidate,
 } from './campaign'
@@ -141,6 +142,8 @@ const checkOutcome = ref<'still-there' | 'gone' | null>(null)
 const checkReason = ref<RemovalReason | null>(null)
 const checkNote = ref('')
 const checkPhotoUrl = ref('')
+// Members of a stacked "same spot" marker whose picker sheet is open.
+const checkSpotPicker = ref<CheckCandidate[] | null>(null)
 const checkReasonOptions: RemovalReason[] = [
   'suspected_opposition',
   'weather',
@@ -302,6 +305,12 @@ function showStatus(message: string): void {
 
 function photoUrl(photo: Pick<PhotoReference, 'id'> & { previewUrl?: string }): string {
   return photo.previewUrl ?? photoUrls.value[photo.id] ?? ''
+}
+
+/** First stored photo of a point, for the same-spot picker thumbnail. */
+function spotThumb(point: FieldPoint): string {
+  const photo = point.photos[0]
+  return photo ? photoUrl(photo) : ''
 }
 
 async function refreshPhotoUrls(): Promise<void> {
@@ -1178,6 +1187,13 @@ const checkTargetDistance = computed(() => {
   return Math.round(draft.candidates.find((candidate) => candidate.point.id === target.id)?.distanceM ?? 0)
 })
 
+// How many disambiguation spots stack several posters on one marker.
+const stackedCheckSpots = computed(() => {
+  const draft = checkDraft.value
+  if (!draft) return 0
+  return groupCheckSpots(draft.candidates).filter((spot) => spot.candidates.length > 1).length
+})
+
 async function captureCampaignCheck(): Promise<void> {
   if (campaignBusy.value || campaignError.value) return
   const video = campaignVideo.value
@@ -1231,20 +1247,29 @@ function renderCheckMarkers(): void {
   if (!map) return
   const draft = checkDraft.value
   if (!draft) return
-  for (const { point, distanceM } of draft.candidates) {
+  for (const spot of groupCheckSpots(draft.candidates)) {
+    const nearest = spot.candidates[0]
+    const stacked = spot.candidates.length > 1
+    // Same-spot candidates share one marker; tapping it opens the picker.
+    const badge = stacked ? `×${spot.candidates.length}` : `${Math.round(nearest.distanceM)} m`
     const icon = L.divIcon({
       className: '',
-      html: `<span class="map-pin" style="--pin-color:${layerFor(point.layerId)?.color ?? '#318b69'}"></span><span class="check-distance-badge">${Math.round(distanceM)} m</span>`,
+      html: `<span class="map-pin" style="--pin-color:${layerFor(nearest.point.layerId)?.color ?? '#318b69'}"></span><span class="check-distance-badge${stacked ? ' is-count' : ''}">${badge}</span>`,
       iconSize: [28, 58],
       iconAnchor: [14, 33],
     })
-    const marker = L.marker([point.lat, point.lng], {
+    const marker = L.marker([spot.lat, spot.lng], {
       icon,
       keyboard: true,
-      title: point.title || 'Poster placement',
+      title: stacked
+        ? `${spot.candidates.length} posters at this spot — tap to choose`
+        : nearest.point.title || 'Poster placement',
     }).addTo(map)
-    marker.on('click', () => selectCheckCandidate(point))
-    checkMarkers.set(point.id, marker)
+    marker.on('click', () => {
+      if (stacked) checkSpotPicker.value = spot.candidates
+      else selectCheckCandidate(nearest.point)
+    })
+    checkMarkers.set(nearest.point.id, marker)
   }
   // "You are here" dot: the GPS fix that was used for the ranking.
   const position = campaignPosition.value
@@ -1272,19 +1297,42 @@ function enterCheckMap(): void {
   // (iOS resizes the dynamic viewport after the map was initialized), so
   // force a re-measure before framing the candidates.
   void nextTick().then(() => {
-    window.requestAnimationFrame(() => {
-      if (!map) return
-      map.invalidateSize()
-      // Frame the matches when there are any, otherwise the nearest candidates.
-      const fit = draft.matches.length > 0 ? draft.matches : draft.candidates.slice(0, 5)
-      const bounds = L.latLngBounds(fit.map((candidate) => L.latLng(candidate.point.lat, candidate.point.lng))).pad(0.5)
-      map.fitBounds(bounds, { maxZoom: 17 })
-    })
+    window.requestAnimationFrame(() => frameCheckSpots())
   })
+}
+
+/**
+ * Frame the ranked candidates, then zoom in until spots at different
+ * locations are far enough apart to tap individually (pins overlap below
+ * ~36px of screen separation). Stacked same-spot candidates need no room.
+ */
+function frameCheckSpots(): void {
+  const draft = checkDraft.value
+  const leafletMap = map
+  if (!draft || !leafletMap) return
+  leafletMap.invalidateSize()
+  // Frame the matches when there are any, otherwise the nearest candidates.
+  const fit = draft.matches.length > 0 ? draft.matches : draft.candidates.slice(0, 5)
+  const bounds = L.latLngBounds(fit.map((candidate) => L.latLng(candidate.point.lat, candidate.point.lng))).pad(0.5)
+  leafletMap.fitBounds(bounds, { maxZoom: 17, animate: false })
+  const spots = groupCheckSpots(draft.candidates)
+  if (spots.length < 2) return
+  for (let step = 0; step < 8 && leafletMap.getZoom() < leafletMap.getMaxZoom(); step += 1) {
+    const positions = spots.map((spot) => leafletMap.latLngToContainerPoint([spot.lat, spot.lng]))
+    let minGapPx = Infinity
+    for (let a = 0; a < positions.length; a += 1) {
+      for (let b = a + 1; b < positions.length; b += 1) {
+        minGapPx = Math.min(minGapPx, positions[a].distanceTo(positions[b]))
+      }
+    }
+    if (minGapPx >= 36) break
+    leafletMap.setZoom(leafletMap.getZoom() + 1, { animate: false })
+  }
 }
 
 function selectCheckCandidate(point: FieldPoint): void {
   if (checkStep.value !== 'map') return
+  checkSpotPicker.value = null
   openCheckConfirm(point)
 }
 
@@ -1310,6 +1358,7 @@ function exitCheckToCamera(): void {
 
 function discardCheckDraft(): void {
   checkDraft.value = null
+  checkSpotPicker.value = null
   if (checkPhotoUrl.value) {
     URL.revokeObjectURL(checkPhotoUrl.value)
     checkPhotoUrl.value = ''
@@ -2229,11 +2278,14 @@ onBeforeUnmount(() => {
             ←
           </button>
           <p class="checkmap-banner" role="status">
-            <template v-if="checkDraft.matches.length">
-              {{ checkDraft.matches.length }} posters within {{ CHECK_MATCH_RADIUS_M }} m — tap one to check it
+            <template v-if="checkDraft.matches.length === 0">
+              No posters within {{ CHECK_MATCH_RADIUS_M }} m — tap the nearest, or record a new one
+            </template>
+            <template v-else-if="stackedCheckSpots > 0">
+              {{ checkDraft.matches.length }} posters within {{ CHECK_MATCH_RADIUS_M }} m — some share a spot, tap the stacked pin to choose
             </template>
             <template v-else>
-              No posters within {{ CHECK_MATCH_RADIUS_M }} m — tap the nearest, or record a new one
+              {{ checkDraft.matches.length }} posters within {{ CHECK_MATCH_RADIUS_M }} m — tap one to check it
             </template>
           </p>
           <button class="campaign-close" type="button" aria-label="Close campaign mode" @click="closeCampaignMode">
@@ -2249,6 +2301,40 @@ onBeforeUnmount(() => {
           >
             Record new poster here
           </button>
+        </div>
+        <div
+          v-if="checkSpotPicker"
+          class="checkmap-spot-picker"
+          role="dialog"
+          aria-label="Choose which poster to check"
+        >
+          <div class="spot-picker-header">
+            <p class="spot-picker-title">{{ checkSpotPicker.length }} posters at this spot</p>
+            <button class="spot-picker-close" type="button" aria-label="Close poster picker" @click="checkSpotPicker = null">
+              ×
+            </button>
+          </div>
+          <ul class="spot-picker-list">
+            <li v-for="(candidate, index) in checkSpotPicker" :key="candidate.point.id">
+              <button class="spot-row" type="button" @click="selectCheckCandidate(candidate.point)">
+                <img
+                  v-if="spotThumb(candidate.point)"
+                  :src="spotThumb(candidate.point)"
+                  class="spot-thumb"
+                  alt=""
+                />
+                <span
+                  v-else
+                  class="spot-dot"
+                  :style="{ '--dot-color': layerFor(candidate.point.layerId)?.color ?? '#318b69' }"
+                ></span>
+                <span class="spot-row-text">
+                  <span class="spot-row-title">{{ candidate.point.title || 'Untitled poster' }}</span>
+                  <span class="spot-row-sub">{{ index === 0 ? 'Nearest · ' : '' }}{{ Math.round(candidate.distanceM) }} m from you</span>
+                </span>
+              </button>
+            </li>
+          </ul>
         </div>
       </div>
       <div class="campaign-bottom" v-show="checkStep === 'camera'">

@@ -3,9 +3,11 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import {
   buildCampaignPoster,
   CHECK_MATCH_RADIUS_M,
+  groupCheckSpots,
   haversineM,
   rankCheckCandidates,
   type CampaignCapture,
+  type CheckCandidate,
 } from './campaign'
 import { base64ToBlob } from './photo-bytes'
 import { offlineDb } from './offline-db'
@@ -254,5 +256,89 @@ describe('rankCheckCandidates', () => {
     expect(selection.matches).toEqual([])
     expect(selection.auto).toBeNull()
     expect(selection.candidates[0].distanceM).toBeGreaterThan(CHECK_MATCH_RADIUS_M)
+  })
+})
+
+describe('groupCheckSpots', () => {
+  let pointCounter = 0
+  const base = { lat: 51.5072, lng: -0.1276 }
+  // 1 degree of latitude ≈ 111320 m, close enough for threshold tests.
+  const northOfBase = (metres: number) => ({ lat: base.lat + metres / 111320, lng: base.lng })
+
+  function makeCandidateAt(lat: number, lng: number): CheckCandidate {
+    pointCounter += 1
+    return {
+      point: {
+        id: `spot-point-${pointCounter}`,
+        mapId: 'map-1',
+        layerId: 'layer-1',
+        lat,
+        lng,
+        title: `Spot poster ${pointCounter}`,
+        description: '',
+        recordType: 'poster',
+        campaign: '',
+        quantity: 1,
+        status: 'active',
+        lastObservedAt: null,
+        removedAt: null,
+        removalReason: null,
+        removalConfidence: null,
+        removalNote: '',
+        events: [],
+        capturedAt: '2026-11-15T09:00:00.000Z',
+        clientCreatedAt: '2026-11-15T09:00:00.000Z',
+        accuracyM: null,
+        author: 'local-user',
+        version: 1,
+        syncStatus: 'synced',
+        photos: [],
+      },
+      distanceM: haversineM(base.lat, base.lng, lat, lng),
+    }
+  }
+
+  it('groups candidates at the same location into one spot', () => {
+    const a = makeCandidateAt(base.lat, base.lng)
+    const b = makeCandidateAt(northOfBase(2).lat, northOfBase(2).lng) // 2 m apart
+    const far = makeCandidateAt(northOfBase(40).lat, northOfBase(40).lng)
+
+    const spots = groupCheckSpots([a, b, far])
+
+    expect(spots).toHaveLength(2)
+    expect(spots[0].candidates.map((candidate) => candidate.point.id)).toEqual([a.point.id, b.point.id])
+    expect(spots[1].candidates.map((candidate) => candidate.point.id)).toEqual([far.point.id])
+  })
+
+  it('keeps candidates just beyond the same-spot threshold in separate spots', () => {
+    const a = makeCandidateAt(base.lat, base.lng)
+    const b = makeCandidateAt(northOfBase(6).lat, northOfBase(6).lng)
+
+    expect(groupCheckSpots([a, b])).toHaveLength(2)
+  })
+
+  it('anchors each spot at its first (closest) candidate', () => {
+    const a = makeCandidateAt(base.lat, base.lng)
+    const nearA = makeCandidateAt(northOfBase(4).lat, northOfBase(4).lng)
+    // 8 m from the anchor but only 4 m from nearA: still its own spot.
+    const b = makeCandidateAt(northOfBase(8).lat, northOfBase(8).lng)
+
+    const spots = groupCheckSpots([a, nearA, b])
+
+    expect(spots).toHaveLength(2)
+    expect(spots[0].lat).toBe(a.point.lat)
+    expect(spots[0].lng).toBe(a.point.lng)
+  })
+
+  it('honours a custom same-spot threshold', () => {
+    const a = makeCandidateAt(base.lat, base.lng)
+    const b = makeCandidateAt(northOfBase(12).lat, northOfBase(12).lng)
+
+    expect(groupCheckSpots([a, b], 15)).toHaveLength(1)
+    expect(groupCheckSpots([a, b])).toHaveLength(2)
+  })
+
+  it('returns no spots for an empty candidate list', () => {
+    expect(groupCheckSpots([])).toEqual([])
   })
 })

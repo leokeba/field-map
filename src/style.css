@@ -1210,6 +1210,136 @@ button {
   box-shadow: 0 0 0 7px #3b82f62e;
 }
 
+/* Stacked marker badge: several posters share this spot. */
+.check-distance-badge.is-count {
+  background: #318b69;
+}
+
+/* Same-spot picker: members of a stacked marker, listed by distance. */
+.checkmap-spot-picker {
+  position: absolute;
+  right: 12px;
+  bottom: calc(96px + env(safe-area-inset-bottom));
+  left: 12px;
+  z-index: 3;
+  max-height: 45%;
+  overflow-y: auto;
+  pointer-events: auto;
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 8px 32px #10150f66;
+  animation: spot-picker-in 0.16s ease-out;
+}
+
+@keyframes spot-picker-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.spot-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px 6px;
+}
+
+.spot-picker-title {
+  margin: 0;
+  color: #10150f;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.spot-picker-close {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  color: #5b6259;
+  background: #f0f1ec;
+  border: 0;
+  border-radius: 50%;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.spot-picker-list {
+  margin: 0;
+  padding: 0 8px 8px;
+  list-style: none;
+}
+
+.spot-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.spot-row:active {
+  background: #f0f1ec;
+}
+
+.spot-thumb,
+.spot-dot {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 10px;
+  background: #f0f1ec;
+}
+
+.spot-thumb {
+  object-fit: cover;
+  background: #e8e9e3;
+}
+
+.spot-dot::after {
+  width: 16px;
+  height: 16px;
+  background: var(--dot-color);
+  border-radius: 50% 50% 50% 7px;
+  transform: rotate(-45deg);
+}
+
+.spot-row-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.spot-row-title {
+  display: block;
+  color: #10150f;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.spot-row-sub {
+  display: block;
+  margin-top: 2px;
+  color: #777d74;
+  font-size: 12px;
+}
+
 .check-summary {
   display: flex;
   align-items: center;

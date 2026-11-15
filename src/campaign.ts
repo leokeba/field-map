@@ -142,3 +142,41 @@ export function rankCheckCandidates(
   const matches = candidates.filter((candidate) => candidate.distanceM <= effectiveRadiusM)
   return { candidates, matches, auto: matches.length === 1 ? matches[0] : null }
 }
+
+/**
+ * Candidates within this distance are treated as being at the same spot:
+ * separate pins there would overlap on a phone screen and only the topmost
+ * would be tappable, so they share one stacked marker instead.
+ */
+export const CHECK_SAME_SPOT_M = 5
+
+export interface CheckSpot {
+  lat: number
+  lng: number
+  candidates: CheckCandidate[]
+}
+
+/**
+ * Group ranked candidates into spots. Each spot is anchored at the first
+ * candidate that created it (the closest one, since input is distance-rank
+ * sorted); any other candidate within `sameSpotM` of the anchor joins it.
+ * Input order is preserved inside each spot.
+ */
+export function groupCheckSpots(
+  candidates: CheckCandidate[],
+  sameSpotM: number = CHECK_SAME_SPOT_M,
+): CheckSpot[] {
+  const spots: CheckSpot[] = []
+  for (const candidate of candidates) {
+    const spot = spots.find(
+      (existing) =>
+        haversineM(existing.lat, existing.lng, candidate.point.lat, candidate.point.lng) <= sameSpotM,
+    )
+    if (spot) {
+      spot.candidates.push(candidate)
+    } else {
+      spots.push({ lat: candidate.point.lat, lng: candidate.point.lng, candidates: [candidate] })
+    }
+  }
+  return spots
+}
