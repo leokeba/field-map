@@ -142,30 +142,34 @@ function toPlainData<T>(value: T): T {
  * Blob-store bug (webkit#188438) can leave records with a corrupt or missing
  * payload; without this they would throw from atob() on every render. The
  * table only holds cached photos, so a full scan is cheap.
+ *
+ * Deliberately no explicit transaction: reading a Blob crosses an event-loop
+ * turn with no pending IDB requests, and WebKit commits idle transactions
+ * early (Dexie error 801). Each operation here runs in its own short-lived
+ * auto-transaction containing only IDB work.
  */
 export async function healPhotoStore(): Promise<void> {
-  await offlineDb.transaction('rw', offlineDb.photos, async () => {
-    const rows = await offlineDb.photos.toArray()
-    for (const row of rows) {
-      if (typeof row.fileData === 'string' && looksLikeBase64(row.fileData)) continue
-      const legacyFile = (row as StoredPhoto & { file?: unknown }).file
-      if (legacyFile instanceof Blob) {
-        await offlineDb.photos.put({
-          id: row.id,
-          pointId: row.pointId,
-          fileData: await blobToBase64(legacyFile),
-          filename: row.filename,
-          mimeType: row.mimeType,
-          capturedAt: row.capturedAt,
-          status: row.status,
-          remoteId: row.remoteId,
-        })
-        continue
-      }
-      console.warn('Dropping photo record without usable bytes', row.id)
-      await offlineDb.photos.delete(row.id)
+  const rows = await offlineDb.photos.toArray()
+  for (const row of rows) {
+    if (typeof row.fileData === 'string' && looksLikeBase64(row.fileData)) continue
+    const legacyFile = (row as StoredPhoto & { file?: unknown }).file
+    if (legacyFile instanceof Blob) {
+      const fileData = await blobToBase64(legacyFile)
+      await offlineDb.photos.put({
+        id: row.id,
+        pointId: row.pointId,
+        fileData,
+        filename: row.filename,
+        mimeType: row.mimeType,
+        capturedAt: row.capturedAt,
+        status: row.status,
+        remoteId: row.remoteId,
+      })
+      continue
     }
-  })
+    console.warn('Dropping photo record without usable bytes', row.id)
+    await offlineDb.photos.delete(row.id)
+  }
 }
 
 export async function initializeWorkspace(selectedMapId?: string): Promise<Workspace> {

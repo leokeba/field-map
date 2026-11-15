@@ -1,5 +1,4 @@
 import Dexie, { type Table } from 'dexie'
-import { blobToBase64 } from './photo-bytes'
 import type {
   FieldLayer,
   FieldMap,
@@ -51,34 +50,19 @@ class FieldMapDatabase extends Dexie {
         })
       })
     // v2 persisted photo bytes as Blobs, which iOS Safari intermittently
-    // refuses to store; re-encode any legacy rows as base64 strings.
-    this.version(3)
-      .stores({
-        maps: 'id, updated_at',
-        layers: 'id, map_id',
-        points: 'id, mapId, syncStatus',
-        photos: 'id, pointId, status',
-        operations: 'id, mapId, pointId, createdAt, status, nextAttemptAt',
-        cursors: 'mapId',
-      })
-      .upgrade(async (transaction) => {
-        const rows = await transaction.table('photos').toArray()
-        for (const row of rows) {
-          const legacy = row as StoredPhoto & { file?: unknown }
-          if (!(legacy.file instanceof Blob)) continue
-          const migrated: StoredPhoto = {
-            id: legacy.id,
-            pointId: legacy.pointId,
-            fileData: await blobToBase64(legacy.file),
-            filename: legacy.filename,
-            mimeType: legacy.mimeType,
-            capturedAt: legacy.capturedAt,
-            status: legacy.status,
-            remoteId: legacy.remoteId,
-          }
-          await transaction.table('photos').put(migrated)
-        }
-      })
+    // refuses to store. Legacy rows are re-encoded at startup by
+    // healPhotoStore() instead of in a versionchange transaction: reading a
+    // Blob crosses an event-loop turn with no pending IDB requests, and
+    // WebKit commits idle transactions early (Dexie error 801), which would
+    // abort the whole upgrade.
+    this.version(3).stores({
+      maps: 'id, updated_at',
+      layers: 'id, map_id',
+      points: 'id, mapId, syncStatus',
+      photos: 'id, pointId, status',
+      operations: 'id, mapId, pointId, createdAt, status, nextAttemptAt',
+      cursors: 'mapId',
+    })
   }
 }
 
