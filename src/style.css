@@ -150,23 +150,6 @@ button {
   pointer-events: auto;
 }
 
-.share-button {
-  min-height: 50px;
-  padding: 0 15px;
-  color: #fff;
-  background: var(--green);
-  border: 0;
-  border-radius: 15px;
-  box-shadow: 0 4px 18px #28302314;
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-}
-
-.share-button:hover {
-  background: var(--green-dark);
-}
-
 .brand {
   display: inline-flex;
   gap: 10px;
@@ -615,6 +598,14 @@ button {
 .map-delete-button:disabled {
   opacity: 0.6;
   cursor: wait;
+}
+
+.map-share-button {
+  width: 100%;
+  margin-top: 12px;
+  color: var(--green-dark);
+  background: #fff;
+  border: 1px solid #c9e0d2;
 }
 
 .map-delete-button {
@@ -2231,10 +2222,6 @@ button {
 
   .topbar-actions {
     gap: 5px;
-  }
-
-  .share-button {
-    padding: 0 10px;
   }
 
   .layers-menu {

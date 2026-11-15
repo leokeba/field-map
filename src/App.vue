@@ -2042,14 +2042,6 @@ onBeforeUnmount(() => {
             </label>
           </div>
         </details>
-        <button
-          v-if="currentRole === 'owner'"
-          class="share-button"
-          type="button"
-          @click="openShareDialog"
-        >
-          Share
-        </button>
       </div>
     </header>
 
@@ -2128,6 +2120,14 @@ onBeforeUnmount(() => {
             {{ mapBusy ? 'Working…' : 'Create map' }}
           </button>
         </form>
+        <button
+          v-if="currentRole === 'owner' && currentMap"
+          class="map-share-button"
+          type="button"
+          @click="openShareDialog"
+        >
+          Share “{{ currentMap.name }}”
+        </button>
         <button
           v-if="currentRole === 'owner' && currentMap"
           class="map-delete-button"
