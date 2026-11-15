@@ -27,6 +27,10 @@ if (typeof navigator === 'undefined') {
   Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { onLine: true } })
 }
 
+// IndexedDB stores photo bytes as base64 strings, never Blobs.
+const IMAGE_BYTES_B64 = 'aW1hZ2UgYnl0ZXM=' // base64("image bytes")
+const CAMERA_FRAME_B64 = 'Y2FtZXJhIGZyYW1l' // base64("camera frame")
+
 function makePoint(overrides: Partial<FieldPoint> = {}): FieldPoint {
   return {
     id: 'point-1',
@@ -70,7 +74,7 @@ describe('offline point queue', () => {
     const photo: StoredPhoto = {
       id: 'photo-local-1',
       pointId: point.id,
-      file: new Blob(['image bytes'], { type: 'image/jpeg' }),
+      fileData: IMAGE_BYTES_B64,
       filename: 'field.jpg',
       mimeType: 'image/jpeg',
       capturedAt: null,
@@ -138,7 +142,7 @@ describe('offline point queue', () => {
     const photo: StoredPhoto = {
       id: 'photo-check-1',
       pointId: point.id,
-      file: new Blob(['camera frame'], { type: 'image/jpeg' }),
+      fileData: CAMERA_FRAME_B64,
       filename: 'poster-check.jpg',
       mimeType: 'image/jpeg',
       capturedAt: '2026-11-14T09:00:00.000Z',
@@ -234,7 +238,7 @@ describe('offline point queue', () => {
     const photo: StoredPhoto = {
       id: 'photo-check-2',
       pointId: point.id,
-      file: new Blob(['camera frame'], { type: 'image/jpeg' }),
+      fileData: CAMERA_FRAME_B64,
       filename: 'poster-check.jpg',
       mimeType: 'image/jpeg',
       capturedAt: '2026-11-14T09:00:00.000Z',
@@ -335,7 +339,7 @@ describe('offline point queue', () => {
     const photo: StoredPhoto = {
       id: 'photo-local-2',
       pointId: point.id,
-      file: new Blob(['image bytes'], { type: 'image/jpeg' }),
+      fileData: IMAGE_BYTES_B64,
       filename: 'queued.jpg',
       mimeType: 'image/jpeg',
       capturedAt: null,
@@ -356,7 +360,7 @@ describe('offline point queue', () => {
     const photo: StoredPhoto = {
       id: 'photo-for-deleted-layer',
       pointId: point.id,
-      file: new Blob(['image bytes'], { type: 'image/jpeg' }),
+      fileData: IMAGE_BYTES_B64,
       filename: 'queued.jpg',
       mimeType: 'image/jpeg',
       capturedAt: null,
@@ -406,7 +410,7 @@ describe('offline point queue', () => {
     const photo: StoredPhoto = {
       id: 'photo-for-deleted-map',
       pointId: point.id,
-      file: new Blob(['image bytes'], { type: 'image/jpeg' }),
+      fileData: IMAGE_BYTES_B64,
       filename: 'queued.jpg',
       mimeType: 'image/jpeg',
       capturedAt: null,

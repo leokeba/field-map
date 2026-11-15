@@ -20,6 +20,7 @@ import {
   uploadPhoto,
 } from './api'
 import { offlineDb } from './offline-db'
+import { blobToBase64, photoBlob } from './photo-bytes'
 import type {
   ApiChange,
   ApiPoint,
@@ -275,7 +276,7 @@ async function cachePhotoBlobs(apiPoint: ApiPoint): Promise<void> {
     const stored: StoredPhoto = {
       id: photo.id,
       pointId: apiPoint.id,
-      file: blob,
+      fileData: await blobToBase64(blob),
       filename: photo.original_filename,
       mimeType: photo.mime_type,
       capturedAt: photo.captured_at,
@@ -601,7 +602,7 @@ async function processPhotos(mapId: string): Promise<void> {
       try {
         const result = await uploadPhoto(
           point.id,
-          photo.file,
+          photoBlob(photo),
           photo.filename,
           photo.capturedAt,
           point.version,

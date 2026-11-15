@@ -7,9 +7,13 @@ import {
   rankCheckCandidates,
   type CampaignCapture,
 } from './campaign'
+import { base64ToBlob } from './photo-bytes'
 import { offlineDb } from './offline-db'
 import { createLocalPoint, updateLocalPoint } from './offline-sync'
 import type { FieldPoint, StoredPhoto } from './types'
+
+// base64("jpeg bytes") — the payload buildCampaignPoster stores in IndexedDB.
+const JPEG_BYTES_B64 = 'anBlZyBieXRlcw=='
 
 function makeCapture(overrides: Partial<CampaignCapture> = {}): CampaignCapture {
   return {
@@ -26,8 +30,8 @@ function makeCapture(overrides: Partial<CampaignCapture> = {}): CampaignCapture 
 }
 
 describe('buildCampaignPoster', () => {
-  it('builds an active poster point with a placed event and no title or campaign', () => {
-    const { point } = buildCampaignPoster(makeCapture())
+  it('builds an active poster point with a placed event and no title or campaign', async () => {
+    const { point } = await buildCampaignPoster(makeCapture())
 
     expect(point).toMatchObject({
       mapId: 'map-1',
@@ -64,22 +68,22 @@ describe('buildCampaignPoster', () => {
     })
   })
 
-  it('keeps a null accuracy when the GPS fix has no reported precision', () => {
-    const { point } = buildCampaignPoster(makeCapture({ accuracyM: null }))
+  it('keeps a null accuracy when the GPS fix has no reported precision', async () => {
+    const { point } = await buildCampaignPoster(makeCapture({ accuracyM: null }))
 
     expect(point.accuracyM).toBeNull()
   })
 
-  it('links the stored photo to the point as a pending upload', () => {
+  it('links the stored photo to the point as a pending upload', async () => {
     const capture = makeCapture()
-    const { point, photo } = buildCampaignPoster(capture)
+    const { point, photo } = await buildCampaignPoster(capture)
 
     expect(point.photos).toEqual([
       { id: photo.id, filename: capture.file.name, status: 'pending', capturedAt: capture.capturedAt },
     ])
     expect(photo).toMatchObject({
       pointId: point.id,
-      file: capture.file,
+      fileData: JPEG_BYTES_B64,
       filename: capture.file.name,
       mimeType: 'image/jpeg',
       capturedAt: capture.capturedAt,
@@ -95,7 +99,7 @@ describe('campaign poster offline queue', () => {
   })
 
   it('persists a campaign point and photo with an idempotent create operation', async () => {
-    const { point, photo } = buildCampaignPoster(makeCapture())
+    const { point, photo } = await buildCampaignPoster(makeCapture())
 
     await createLocalPoint(point, [photo])
 
@@ -118,7 +122,7 @@ describe('campaign poster offline queue', () => {
   })
 
   it('leaves the queued poster editable through the normal offline update flow', async () => {
-    const { point } = buildCampaignPoster(makeCapture())
+    const { point } = await buildCampaignPoster(makeCapture())
     await createLocalPoint(point, [])
 
     const updated: FieldPoint = { ...point, title: 'Main street pole', syncStatus: 'pending' }
@@ -130,15 +134,20 @@ describe('campaign poster offline queue', () => {
     ])
   })
 
-  it('exposes the captured file for the photo sync pipeline', async () => {
+  it('exposes the captured bytes for the photo sync pipeline', async () => {
     const capture = makeCapture()
-    const { point, photo }: { point: FieldPoint; photo: StoredPhoto } = buildCampaignPoster(capture)
+    const { point, photo }: { point: FieldPoint; photo: StoredPhoto } = await buildCampaignPoster(capture)
     await createLocalPoint(point, [photo])
 
     const stored = await offlineDb.photos.get(photo.id)
-    // IndexedDB round-trips a File as a Blob; assert on the content, not identity.
-    expect(stored?.file).toBeInstanceOf(Blob)
-    expect(stored?.file).toMatchObject({ size: capture.file.size, type: capture.file.type })
+    // IndexedDB round-trips the base64 payload verbatim; assert on the
+    // rehydrated content, not identity.
+    expect(stored?.fileData).toBe(JPEG_BYTES_B64)
+    if (stored) {
+      const blob = base64ToBlob(stored.fileData, stored.mimeType)
+      expect(await blob.text()).toBe('jpeg bytes')
+      expect(blob.type).toBe(capture.file.type)
+    }
   })
 })
 

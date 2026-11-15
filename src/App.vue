@@ -40,6 +40,7 @@ import {
   useServerVersion,
 } from './offline-sync'
 import { offlineDb } from './offline-db'
+import { blobToBase64, photoBlob } from './photo-bytes'
 import type {
   FieldLayer,
   FieldMap,
@@ -318,7 +319,7 @@ async function refreshPhotoUrls(): Promise<void> {
   for (const photo of photos) {
     if (photoUrls.value[photo.id]) continue
     const stored = await offlineDb.photos.get(photo.id)
-    if (stored) photoUrls.value[photo.id] = URL.createObjectURL(stored.file)
+    if (stored) photoUrls.value[photo.id] = URL.createObjectURL(photoBlob(stored))
   }
 }
 
@@ -1127,7 +1128,7 @@ async function captureCampaignPoster(): Promise<void> {
     const position = await ensureCampaignPosition()
     const frame = await captureFrame(video)
     const prepared = await preparePhoto(frame)
-    const { point, photo } = buildCampaignPoster({
+    const { point, photo } = await buildCampaignPoster({
       mapId: mapId.value,
       layerId: activeLayerId.value,
       lat: position.lat,
@@ -1349,7 +1350,7 @@ async function recordCheckOutcome(outcome: 'observed' | 'removed'): Promise<void
     const photo: StoredPhoto = {
       id: crypto.randomUUID(),
       pointId: point.id,
-      file: draft.prepared.blob,
+      fileData: await blobToBase64(draft.prepared.blob),
       filename: draft.prepared.filename,
       mimeType: 'image/jpeg',
       capturedAt: occurredAt,
@@ -1376,7 +1377,7 @@ async function recordCheckAsNew(): Promise<void> {
   if (!draft || !mapId.value || !canEdit.value || campaignBusy.value) return
   campaignBusy.value = true
   try {
-    const { point, photo } = buildCampaignPoster({
+    const { point, photo } = await buildCampaignPoster({
       mapId: mapId.value,
       layerId: activeLayerId.value,
       lat: draft.position.lat,
@@ -1422,7 +1423,7 @@ async function editPoint(point: FieldPoint): Promise<void> {
       const stored = await offlineDb.photos.get(photo.id)
       return {
         ...photo,
-        file: stored?.file,
+        file: stored ? photoBlob(stored) : undefined,
         mimeType: stored?.mimeType,
         remoteId: stored?.remoteId,
         isNew: false,
@@ -1453,19 +1454,19 @@ async function savePoint(): Promise<void> {
   const photoReferences: PhotoReference[] = draft.photos.map(
     ({ id, filename, status, capturedAt }) => ({ id, filename, status, capturedAt }),
   )
-  const addedPhotos: StoredPhoto[] = draft.photos
-    .filter(
-      (photo): photo is DraftPhoto & { file: Blob } => photo.isNew === true && photo.file !== undefined,
-    )
-    .map((photo) => ({
+  const addedPhotos: StoredPhoto[] = []
+  for (const photo of draft.photos) {
+    if (photo.isNew !== true || photo.file === undefined) continue
+    addedPhotos.push({
       id: photo.id,
       pointId,
-      file: photo.file,
+      fileData: await blobToBase64(photo.file),
       filename: photo.filename,
-      mimeType: photo.mimeType ?? photo.file?.type ?? 'image/jpeg',
+      mimeType: photo.mimeType ?? photo.file.type ?? 'image/jpeg',
       capturedAt: photo.capturedAt,
       status: 'pending',
-    }))
+    })
+  }
 
   try {
     if (editingPointId.value) {

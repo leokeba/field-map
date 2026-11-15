@@ -1,3 +1,4 @@
+import { blobToBase64 } from './photo-bytes'
 import type { FieldPoint, PosterEvent, StoredPhoto } from './types'
 
 export interface CampaignCapture {
@@ -20,7 +21,7 @@ export interface CampaignPoster {
  * Build the one-click campaign poster: an active FieldPoint with a single
  * 'placed' event plus the stored camera photo that travels with it.
  */
-export function buildCampaignPoster(capture: CampaignCapture): CampaignPoster {
+export async function buildCampaignPoster(capture: CampaignCapture): Promise<CampaignPoster> {
   const pointId = crypto.randomUUID()
   const photoId = crypto.randomUUID()
   const recordedAt = new Date().toISOString()
@@ -64,7 +65,7 @@ export function buildCampaignPoster(capture: CampaignCapture): CampaignPoster {
   const photo: StoredPhoto = {
     id: photoId,
     pointId,
-    file: capture.file,
+    fileData: await blobToBase64(capture.file),
     filename: capture.file.name,
     mimeType: capture.file.type || 'image/jpeg',
     capturedAt: capture.capturedAt,

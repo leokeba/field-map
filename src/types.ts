@@ -141,7 +141,8 @@ export interface FieldPoint {
 export interface StoredPhoto {
   id: string
   pointId: string
-  file: Blob
+  /** Photo bytes as a base64 string — never store Blobs in IndexedDB (iOS Safari webkit#188438). */
+  fileData: string
   filename: string
   mimeType: string
   capturedAt: string | null

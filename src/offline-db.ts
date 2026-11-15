@@ -1,4 +1,5 @@
 import Dexie, { type Table } from 'dexie'
+import { blobToBase64 } from './photo-bytes'
 import type {
   FieldLayer,
   FieldMap,
@@ -48,6 +49,35 @@ class FieldMapDatabase extends Dexie {
           point.removalNote ??= ''
           point.events ??= []
         })
+      })
+    // v2 persisted photo bytes as Blobs, which iOS Safari intermittently
+    // refuses to store; re-encode any legacy rows as base64 strings.
+    this.version(3)
+      .stores({
+        maps: 'id, updated_at',
+        layers: 'id, map_id',
+        points: 'id, mapId, syncStatus',
+        photos: 'id, pointId, status',
+        operations: 'id, mapId, pointId, createdAt, status, nextAttemptAt',
+        cursors: 'mapId',
+      })
+      .upgrade(async (transaction) => {
+        const rows = await transaction.table('photos').toArray()
+        for (const row of rows) {
+          const legacy = row as StoredPhoto & { file?: unknown }
+          if (!(legacy.file instanceof Blob)) continue
+          const migrated: StoredPhoto = {
+            id: legacy.id,
+            pointId: legacy.pointId,
+            fileData: await blobToBase64(legacy.file),
+            filename: legacy.filename,
+            mimeType: legacy.mimeType,
+            capturedAt: legacy.capturedAt,
+            status: legacy.status,
+            remoteId: legacy.remoteId,
+          }
+          await transaction.table('photos').put(migrated)
+        }
       })
   }
 }
